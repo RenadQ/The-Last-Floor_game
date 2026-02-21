@@ -1,0 +1,1651 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View,
+  Text,
+  TouchableOpacity,
+  StyleSheet,
+  SafeAreaView,
+  useWindowDimensions,
+  Platform,
+  Alert,
+  Animated,
+  Easing,
+} from "react-native";
+import Svg, { Rect, Circle, Defs, Mask } from "react-native-svg";
+
+/* =========================
+   SAFE expo-av (NO CRASH)
+========================= */
+const ExpoAV = (() => {
+  try {
+    return require("expo-av");
+  } catch {
+    return null;
+  }
+})();
+const Audio = ExpoAV?.Audio ?? null;
+
+/* =========================
+   CONFIG
+========================= */
+const WORLD_W = 900;  // smaller world so movement feels correct
+const WORLD_H = 600;
+
+const PLAYER_R = 16;
+const PLAYER_SPD = 220; // pixels per second
+
+const ENEMY_R = 18;
+const ENEMY_SPD = 120; // px/s
+const ENEMY_HIT_COOLDOWN_MS = 900;
+
+const VISION_RADIUS = 180;
+const ENEMY_SHOW_RADIUS = 200;
+
+const INTERACT_RADIUS = 65;
+
+const KEY_HOLD_MS = 5000;
+const BANDAGE_HOLD_MS = 2500;
+
+const MAX_HEARTS = 3;
+
+// Panic event (after second key)
+const PANIC_DELAY_MS = 5 * 60 * 1000;
+const PANIC_DURATION_MS = 60 * 1000;
+const PANIC_EXTRA_ENEMIES = 3;
+
+// Mic lure (optional)
+const MIC_ENABLED_DEFAULT = true;
+const MIC_POLL_MS = 220;
+const MIC_THRESHOLD_DB = -28;
+const MIC_LURE_RADIUS = 280;
+const MIC_ENEMY_SPEED_BOOST = 1.35;
+
+// Audio URLs (optional)
+const SOUND_URLS = {
+  ambience:
+    "https://cdn.pixabay.com/download/audio/2022/03/15/audio_2e5b4f6c6d.mp3?filename=dark-ambient-110997.mp3",
+  panic:
+    "https://cdn.pixabay.com/download/audio/2022/10/30/audio_5b8b1b0d65.mp3?filename=horror-swell-124320.mp3",
+  enemySteps:
+    "https://cdn.pixabay.com/download/audio/2022/03/15/audio_613a4d17f0.mp3?filename=footsteps-on-wood-110997.mp3",
+};
+
+function clamp(v, a, b) {
+  return Math.max(a, Math.min(b, v));
+}
+function dist(ax, ay, bx, by) {
+  const dx = ax - bx;
+  const dy = ay - by;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+function aabbOverlap(ax, ay, aw, ah, bx, by, bw, bh) {
+  return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+}
+function circleRectCollide(cx, cy, cr, rx, ry, rw, rh) {
+  const nx = clamp(cx, rx, rx + rw);
+  const ny = clamp(cy, ry, ry + rh);
+  const dx = cx - nx;
+  const dy = cy - ny;
+  return dx * dx + dy * dy < cr * cr;
+}
+
+/* =========================
+   THEMES (hidden floor number)
+========================= */
+const THEMES = [
+  { bg: "#070a0f", wall: "#121a2a", edge: "rgba(255,255,255,0.10)", accent: "#3b6cff" },
+  { bg: "#09060f", wall: "#21122a", edge: "rgba(255,255,255,0.10)", accent: "#ff3b8d" },
+  { bg: "#070d0b", wall: "#0f2418", edge: "rgba(255,255,255,0.10)", accent: "#37ff9b" },
+  { bg: "#0a0506", wall: "#2a1216", edge: "rgba(255,255,255,0.10)", accent: "#ff3b3b" },
+];
+
+const CHARACTERS = [
+  { id: "runner", name: "Runner", color: "#ffffff", ring: "#3b6cff" },
+  { id: "survivor", name: "Survivor", color: "#f1e7d7", ring: "#37ff9b" },
+  { id: "night", name: "Night", color: "#d9d9d9", ring: "#ff3b8d" },
+];
+
+/* =========================
+   FLOORS (adjusted to be safe)
+========================= */
+function buildFloors() {
+  return [
+    {
+      walls: [
+        { x: 0, y: 0, w: WORLD_W, h: 22 },
+        { x: 0, y: WORLD_H - 22, w: WORLD_W, h: 22 },
+        { x: 0, y: 0, w: 22, h: WORLD_H },
+        { x: WORLD_W - 22, y: 0, w: 22, h: WORLD_H },
+
+        { x: 140, y: 90, w: 260, h: 22 },
+        { x: 140, y: 90, w: 22, h: 210 },
+        { x: 378, y: 90, w: 22, h: 210 },
+        { x: 200, y: 280, w: 200, h: 22 },
+
+        { x: 520, y: 160, w: 280, h: 22 },
+        { x: 520, y: 160, w: 22, h: 260 },
+        { x: 240, y: 420, w: 360, h: 22 },
+      ],
+      elevator: { x: 50, y: 470, w: 110, h: 90 },
+      key: { x: 770, y: 90 },
+      bandage: { x: 420, y: 520, taken: false },
+      enemies: [
+        { x: 720, y: 340, patrol: [{ x: 720, y: 340 }, { x: 820, y: 340 }] },
+        { x: 260, y: 180, patrol: [{ x: 260, y: 180 }, { x: 360, y: 180 }] },
+      ],
+      spawn: { x: 90, y: 520 },
+    },
+    {
+      walls: [
+        { x: 0, y: 0, w: WORLD_W, h: 22 },
+        { x: 0, y: WORLD_H - 22, w: WORLD_W, h: 22 },
+        { x: 0, y: 0, w: 22, h: WORLD_H },
+        { x: WORLD_W - 22, y: 0, w: 22, h: WORLD_H },
+
+        { x: 90, y: 120, w: 720, h: 22 },
+        { x: 90, y: 120, w: 22, h: 360 },
+        { x: 788, y: 120, w: 22, h: 360 },
+        { x: 90, y: 458, w: 720, h: 22 },
+
+        { x: 260, y: 220, w: 380, h: 22 },
+        { x: 260, y: 220, w: 22, h: 170 },
+        { x: 618, y: 220, w: 22, h: 170 },
+        { x: 260, y: 368, w: 380, h: 22 },
+      ],
+      elevator: { x: 740, y: 470, w: 110, h: 90 },
+      key: { x: 120, y: 170 },
+      bandage: { x: 450, y: 300, taken: false },
+      enemies: [
+        { x: 450, y: 170, patrol: [{ x: 450, y: 170 }, { x: 450, y: 460 }] },
+        { x: 650, y: 420, patrol: [{ x: 650, y: 420 }, { x: 260, y: 420 }] },
+      ],
+      spawn: { x: 780, y: 520 },
+    },
+    {
+      walls: [
+        { x: 0, y: 0, w: WORLD_W, h: 22 },
+        { x: 0, y: WORLD_H - 22, w: WORLD_W, h: 22 },
+        { x: 0, y: 0, w: 22, h: WORLD_H },
+        { x: WORLD_W - 22, y: 0, w: 22, h: WORLD_H },
+
+        { x: 110, y: 80, w: 22, h: 440 },
+        { x: 200, y: 80, w: 22, h: 440 },
+        { x: 290, y: 80, w: 22, h: 440 },
+        { x: 380, y: 80, w: 22, h: 440 },
+        { x: 470, y: 80, w: 22, h: 440 },
+
+        { x: 110, y: 190, w: 382, h: 22 },
+        { x: 200, y: 320, w: 382, h: 22 },
+        { x: 110, y: 450, w: 382, h: 22 },
+      ],
+      elevator: { x: 50, y: 40, w: 110, h: 90 },
+      key: { x: 820, y: 520 },
+      bandage: { x: 720, y: 120, taken: false },
+      enemies: [
+        { x: 720, y: 440, patrol: [{ x: 720, y: 440 }, { x: 720, y: 180 }] },
+        { x: 600, y: 120, patrol: [{ x: 600, y: 120 }, { x: 840, y: 120 }] },
+      ],
+      spawn: { x: 100, y: 90 },
+    },
+    {
+      walls: [
+        { x: 0, y: 0, w: WORLD_W, h: 22 },
+        { x: 0, y: WORLD_H - 22, w: WORLD_W, h: 22 },
+        { x: 0, y: 0, w: 22, h: WORLD_H },
+        { x: WORLD_W - 22, y: 0, w: 22, h: WORLD_H },
+
+        { x: 90, y: 90, w: 720, h: 22 },
+        { x: 90, y: 90, w: 22, h: 420 },
+        { x: 788, y: 90, w: 22, h: 420 },
+        { x: 90, y: 488, w: 720, h: 22 },
+
+        { x: 260, y: 200, w: 380, h: 22 },
+        { x: 260, y: 200, w: 22, h: 220 },
+        { x: 618, y: 200, w: 22, h: 220 },
+        { x: 260, y: 398, w: 380, h: 22 },
+
+        { x: 420, y: 300, w: 80, h: 22 },
+      ],
+      elevator: { x: 395, y: 40, w: 110, h: 90 },
+      key: { x: 430, y: 540 },
+      bandage: { x: 140, y: 540, taken: false },
+      enemies: [
+        { x: 300, y: 260, patrol: [{ x: 200, y: 260 }, { x: 700, y: 260 }] },
+        { x: 700, y: 430, patrol: [{ x: 700, y: 200 }, { x: 700, y: 520 }] },
+      ],
+      spawn: { x: 450, y: 110 },
+    },
+  ];
+}
+
+/* =========================
+   AUDIO HELPERS
+========================= */
+async function safeLoadLoop(uri, initialVolume = 0.6) {
+  try {
+    if (!Audio) return null;
+    const { sound } = await Audio.Sound.createAsync(
+      { uri },
+      { shouldPlay: false, isLooping: true, volume: initialVolume }
+    );
+    return sound;
+  } catch {
+    return null;
+  }
+}
+async function safePlay(sound) {
+  try {
+    if (!sound) return;
+    await sound.playAsync();
+  } catch {}
+}
+async function safeSetVolume(sound, v) {
+  try {
+    if (!sound) return;
+    await sound.setVolumeAsync(clamp(v, 0, 1));
+  } catch {}
+}
+async function safeUnload(sound) {
+  try {
+    if (!sound) return;
+    await sound.unloadAsync();
+  } catch {}
+}
+
+/* =========================
+   HELPERS: SAFE SPAWN
+========================= */
+function isCircleInsideWall(x, y, r, walls) {
+  for (const w of walls) {
+    if (circleRectCollide(x, y, r, w.x, w.y, w.w, w.h)) return true;
+  }
+  return false;
+}
+function findNearestFreeSpawn(spawn, walls) {
+  const { x, y } = spawn;
+  if (!isCircleInsideWall(x, y, PLAYER_R, walls)) return { x, y };
+
+  const step = 18;
+  for (let radius = step; radius <= 260; radius += step) {
+    for (let a = 0; a < 360; a += 30) {
+      const rad = (a * Math.PI) / 180;
+      const nx = clamp(x + Math.cos(rad) * radius, PLAYER_R, WORLD_W - PLAYER_R);
+      const ny = clamp(y + Math.sin(rad) * radius, PLAYER_R, WORLD_H - PLAYER_R);
+      if (!isCircleInsideWall(nx, ny, PLAYER_R, walls)) return { x: nx, y: ny };
+    }
+  }
+  return { x: clamp(x, PLAYER_R, WORLD_W - PLAYER_R), y: clamp(y, PLAYER_R, WORLD_H - PLAYER_R) };
+}
+
+/* =========================
+   UI COMPONENTS
+========================= */
+function HeartRow({ hearts }) {
+  return (
+    <View style={{ flexDirection: "row", gap: 6, alignItems: "center" }}>
+      {Array.from({ length: MAX_HEARTS }).map((_, i) => (
+        <View key={i} style={[styles.heart, { opacity: i < hearts ? 1 : 0.25 }]} />
+      ))}
+    </View>
+  );
+}
+
+function CaptureOverlay({ visible, title, progress01, accent }) {
+  if (!visible) return null;
+  const size = 66;
+  const r = 26;
+  const c = 2 * Math.PI * r;
+  const dashOffset = c * (1 - clamp(progress01, 0, 1));
+
+  return (
+    <View style={styles.captureWrap} pointerEvents="none">
+      <View style={styles.captureCard}>
+        <Text style={styles.captureTitle}>{title}</Text>
+        <View style={{ height: 10 }} />
+        <Svg width={size} height={size}>
+          <Circle cx={size / 2} cy={size / 2} r={r} stroke="rgba(255,255,255,0.18)" strokeWidth="6" fill="none" />
+          <Circle
+            cx={size / 2}
+            cy={size / 2}
+            r={r}
+            stroke={accent}
+            strokeWidth="6"
+            fill="none"
+            strokeLinecap="round"
+            strokeDasharray={`${c} ${c}`}
+            strokeDashoffset={dashOffset}
+            transform={`rotate(-90 ${size / 2} ${size / 2})`}
+          />
+        </Svg>
+        <View style={{ height: 10 }} />
+        <Text style={styles.capturePct}>{Math.round(progress01 * 100)}%</Text>
+        <Text style={styles.captureSub}>Hold to complete</Text>
+      </View>
+    </View>
+  );
+}
+
+function ElevatorDoorsOverlay({ visible, progress, label }) {
+  if (!visible) return null;
+
+  const leftX = progress.interpolate({ inputRange: [0, 1], outputRange: [-220, 0] });
+  const rightX = progress.interpolate({ inputRange: [0, 1], outputRange: [220, 0] });
+  const fade = progress.interpolate({ inputRange: [0, 1], outputRange: [0.0, 0.92] });
+
+  return (
+    <View style={styles.doorsWrap} pointerEvents="none">
+      <Animated.View style={[styles.doorPanel, styles.doorLeft, { transform: [{ translateX: leftX }] }]} />
+      <Animated.View style={[styles.doorPanel, styles.doorRight, { transform: [{ translateX: rightX }] }]} />
+      <Animated.View style={[styles.doorShade, { opacity: fade }]} />
+      <View style={styles.doorLabelWrap}>
+        <Text style={styles.doorLabel}>{label}</Text>
+      </View>
+    </View>
+  );
+}
+
+/* =========================
+   SCREENS
+========================= */
+function HomeScreen({
+  selectedCharId,
+  setSelectedCharId,
+  micEnabled,
+  setMicEnabled,
+  canUseAV,
+  onStart,
+  onRules,
+}) {
+  return (
+    <SafeAreaView style={[styles.full, { backgroundColor: "#050608" }]}>
+      <View style={styles.safePad}>
+        <Text style={styles.homeTitle}>THE LAST FLOOR</Text>
+        <Text style={styles.homeSub}>Choose your character.</Text>
+
+        {!canUseAV ? (
+          <Text style={styles.warnText}>
+            Audio is disabled because expo-av is not available in your environment. The game still runs.
+          </Text>
+        ) : null}
+
+        <Text style={styles.sectionTitle}>Characters</Text>
+        <View style={styles.charRow}>
+          {CHARACTERS.map((c) => {
+            const active = c.id === selectedCharId;
+            return (
+              <TouchableOpacity
+                key={c.id}
+                onPress={() => setSelectedCharId(c.id)}
+                style={[styles.card, { borderColor: active ? c.ring : "rgba(255,255,255,0.10)" }]}
+              >
+                <View style={[styles.avatar, { backgroundColor: c.color, borderColor: c.ring }]} />
+                <Text style={styles.cardTitle}>{c.name}</Text>
+                <Text style={styles.cardSub}>No combat. Run only.</Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+
+        <Text style={styles.sectionTitle}>Settings</Text>
+        <View style={styles.rowBetween}>
+          <Text style={styles.muted}>Microphone lure</Text>
+          <TouchableOpacity
+            disabled={!canUseAV}
+            onPress={() => setMicEnabled((v) => !v)}
+            style={[
+              styles.toggle,
+              {
+                opacity: canUseAV ? 1 : 0.35,
+                backgroundColor: micEnabled ? "rgba(55,255,155,0.25)" : "rgba(255,255,255,0.08)",
+              },
+            ]}
+          >
+            <Text style={styles.toggleText}>{micEnabled ? "ON" : "OFF"}</Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={{ flex: 1 }} />
+
+        <TouchableOpacity onPress={onStart} style={styles.primaryBtn}>
+          <Text style={styles.primaryBtnText}>Start</Text>
+        </TouchableOpacity>
+
+        <View style={{ height: 10 }} />
+
+        <TouchableOpacity onPress={onRules} style={styles.secondaryBtn}>
+          <Text style={styles.secondaryBtnText}>Rules</Text>
+        </TouchableOpacity>
+      </View>
+    </SafeAreaView>
+  );
+}
+
+function RulesScreen({ onBack }) {
+  return (
+    <SafeAreaView style={[styles.full, { backgroundColor: "#050608" }]}>
+      <View style={styles.safePad}>
+        <Text style={styles.rulesTitle}>Rules</Text>
+        <Text style={styles.rulesText}>
+          1) 2D top-down map with zoom.{"\n"}
+          2) Darkness hides far enemies. Only close enemies appear.{"\n"}
+          3) 3 hearts. Each hit removes 1 heart.{"\n"}
+          4) No defense. Only escape.{"\n"}
+          5) Hold CAPTURE to take keys (5 seconds).{"\n"}
+          6) Hold CAPTURE to take bandage (restores 1 heart).{"\n"}
+          7) Elevator moves you to a random floor. You do not know the floor number.{"\n"}
+          8) After the second key, a lockdown happens for 60 seconds with extra enemies.{"\n"}
+          9) If microphone lure is ON, loud speech attracts enemies.{"\n"}
+        </Text>
+        <View style={{ flex: 1 }} />
+        <TouchableOpacity onPress={onBack} style={styles.primaryBtn}>
+          <Text style={styles.primaryBtnText}>Back</Text>
+        </TouchableOpacity>
+      </View>
+    </SafeAreaView>
+  );
+}
+
+/* =========================
+   MAIN APP
+========================= */
+export default function App() {
+  const canUseAV = !!Audio;
+  const { width, height } = useWindowDimensions();
+
+  // Responsive UI: header + hint fixed, world flex, controls fixed
+  const isSmallPhone = Math.min(width, height) < 380;
+  const HUD_H = isSmallPhone ? 92 : 98;
+  const HINT_H = 54;
+  const CONTROLS_H = isSmallPhone ? 210 : 220;
+  const SAFE_BOTTOM_PAD = Platform.OS === "ios" ? 16 : 10;
+
+  // zoom is computed to fit the smaller world nicely on any phone
+  const ZOOM = useMemo(() => {
+    const short = Math.min(width, height);
+    if (short <= 360) return 1.35;
+    if (short <= 390) return 1.42;
+    if (short <= 430) return 1.50;
+    return 1.55;
+  }, [width, height]);
+
+  const [screen, setScreen] = useState("HOME"); // HOME | RULES | PLAY | LOSE | WIN
+
+  const floorsRef = useRef(buildFloors());
+  const [floorIndex, setFloorIndex] = useState(0);
+  const floorIndexRef = useRef(0);
+
+  const [keysTaken, setKeysTaken] = useState([false, false, false, false]);
+  const keysTakenRef = useRef([false, false, false, false]);
+
+  const [hearts, setHearts] = useState(MAX_HEARTS);
+  const heartsRef = useRef(MAX_HEARTS);
+
+  const [selectedCharId, setSelectedCharId] = useState(CHARACTERS[0].id);
+
+  const [micEnabled, setMicEnabled] = useState(MIC_ENABLED_DEFAULT);
+  const [micDb, setMicDb] = useState(-160);
+  const micDbRef = useRef(-160);
+
+  const [panic, setPanic] = useState({ active: false, endsAt: 0, startsAt: 0 });
+  const panicRef = useRef({ active: false, endsAt: 0, startsAt: 0 });
+
+  const [player, setPlayer] = useState(() => {
+    const f = floorsRef.current[0];
+    return { x: f.spawn.x, y: f.spawn.y };
+  });
+  const playerRef = useRef({ x: 0, y: 0 });
+
+  const enemiesRef = useRef([]);
+
+  // Movement state: to avoid sticky lag, we use a loop plus ref flags
+  const moveRef = useRef({ up: false, down: false, left: false, right: false });
+
+  // Capture
+  const captureRef = useRef(null);
+  const [captureUI, setCaptureUI] = useState({ visible: false, type: null, progress01: 0 });
+
+  const lastHitRef = useRef(0);
+  const secondKeyTimeRef = useRef(null);
+
+  // Audio refs
+  const ambienceRef = useRef(null);
+  const panicSndRef = useRef(null);
+  const stepsRef = useRef(null);
+
+  // Mic
+  const recRef = useRef(null);
+  const micPollRef = useRef(null);
+
+  // Elevator doors
+  const [elevatorBusy, setElevatorBusy] = useState(false);
+  const doorsProgress = useRef(new Animated.Value(0)).current;
+  const [doorsLabel, setDoorsLabel] = useState("ELEVATOR");
+  const [doorsVisible, setDoorsVisible] = useState(false);
+
+  const currentFloor = floorsRef.current[floorIndex];
+  const theme = THEMES[floorIndex];
+  const char = CHARACTERS.find((c) => c.id === selectedCharId) || CHARACTERS[0];
+
+  // Viewport flex:1, but we still compute camera using actual world area height estimate
+  const viewH = useMemo(() => {
+    const usable = height - HUD_H - HINT_H - CONTROLS_H - SAFE_BOTTOM_PAD;
+    return Math.max(240, usable);
+  }, [height, HUD_H, HINT_H, CONTROLS_H, SAFE_BOTTOM_PAD]);
+
+  const camera = useMemo(() => {
+    const centerX = player.x;
+    const centerY = player.y;
+
+    const scaledW = width / ZOOM;
+    const scaledH = viewH / ZOOM;
+
+    const left = clamp(centerX - scaledW / 2, 0, WORLD_W - scaledW);
+    const top = clamp(centerY - scaledH / 2, 0, WORLD_H - scaledH);
+
+    return { translateX: -left * ZOOM, translateY: -top * ZOOM };
+  }, [player.x, player.y, width, viewH, ZOOM]);
+
+  // Sync refs
+  useEffect(() => {
+    floorIndexRef.current = floorIndex;
+  }, [floorIndex]);
+  useEffect(() => {
+    keysTakenRef.current = keysTaken;
+  }, [keysTaken]);
+  useEffect(() => {
+    heartsRef.current = hearts;
+  }, [hearts]);
+  useEffect(() => {
+    playerRef.current = player;
+  }, [player]);
+  useEffect(() => {
+    micDbRef.current = micDb;
+  }, [micDb]);
+  useEffect(() => {
+    panicRef.current = panic;
+  }, [panic]);
+
+  // Initialize floor safely (fixes getting stuck)
+  useEffect(() => {
+    const f = floorsRef.current[floorIndex];
+
+    enemiesRef.current = f.enemies.map((e) => ({
+      x: e.x,
+      y: e.y,
+      patrol: e.patrol,
+      patrolIndex: 1,
+      kind: "BASE",
+    }));
+
+    const safeSpawn = findNearestFreeSpawn(f.spawn, f.walls);
+    setPlayer(safeSpawn);
+    playerRef.current = safeSpawn;
+
+    captureRef.current = null;
+    setCaptureUI({ visible: false, type: null, progress01: 0 });
+  }, [floorIndex]);
+
+  // Audio setup
+  useEffect(() => {
+    if (!canUseAV) return;
+
+    let mounted = true;
+
+    (async () => {
+      try {
+        await Audio.setAudioModeAsync({
+          allowsRecordingIOS: true,
+          playsInSilentModeIOS: true,
+          staysActiveInBackground: false,
+          shouldDuckAndroid: true,
+        });
+      } catch {}
+
+      const ambience = await safeLoadLoop(SOUND_URLS.ambience, 0.45);
+      const panicSnd = await safeLoadLoop(SOUND_URLS.panic, 0.0);
+      const steps = await safeLoadLoop(SOUND_URLS.enemySteps, 0.0);
+
+      if (!mounted) {
+        await safeUnload(ambience);
+        await safeUnload(panicSnd);
+        await safeUnload(steps);
+        return;
+      }
+
+      ambienceRef.current = ambience;
+      panicSndRef.current = panicSnd;
+      stepsRef.current = steps;
+
+      await safePlay(ambienceRef.current);
+      await safePlay(panicSndRef.current);
+      await safePlay(stepsRef.current);
+    })();
+
+    return () => {
+      mounted = false;
+      (async () => {
+        await safeUnload(ambienceRef.current);
+        await safeUnload(panicSndRef.current);
+        await safeUnload(stepsRef.current);
+      })();
+    };
+  }, [canUseAV]);
+
+  // Mic start/stop
+  useEffect(() => {
+    const shouldRun = canUseAV && screen === "PLAY" && micEnabled;
+
+    const stopMic = async () => {
+      if (micPollRef.current) {
+        clearInterval(micPollRef.current);
+        micPollRef.current = null;
+      }
+      try {
+        if (recRef.current) {
+          const r = recRef.current;
+          recRef.current = null;
+          await r.stopAndUnloadAsync();
+        }
+      } catch {}
+      setMicDb(-160);
+    };
+
+    const startMic = async () => {
+      try {
+        const perm = await Audio.requestPermissionsAsync();
+        if (!perm.granted) {
+          setMicEnabled(false);
+          Alert.alert("Microphone", "Permission not granted. Microphone lure turned OFF.");
+          return;
+        }
+
+        const rec = new Audio.Recording();
+        await rec.prepareToRecordAsync({
+          android: {
+            extension: ".m4a",
+            outputFormat: Audio.AndroidOutputFormat.MPEG_4,
+            audioEncoder: Audio.AndroidAudioEncoder.AAC,
+            sampleRate: 44100,
+            numberOfChannels: 1,
+            bitRate: 64000,
+          },
+          ios: {
+            extension: ".caf",
+            audioQuality: Audio.IOSAudioQuality.MIN,
+            sampleRate: 44100,
+            numberOfChannels: 1,
+            bitRate: 64000,
+            linearPCMBitDepth: 16,
+            linearPCMIsBigEndian: false,
+            linearPCMIsFloat: false,
+          },
+          isMeteringEnabled: true,
+        });
+
+        await rec.startAsync();
+        recRef.current = rec;
+
+        micPollRef.current = setInterval(async () => {
+          try {
+            if (!recRef.current) return;
+            const s = await recRef.current.getStatusAsync();
+            if (typeof s.metering === "number") setMicDb(s.metering);
+          } catch {}
+        }, MIC_POLL_MS);
+      } catch {
+        setMicEnabled(false);
+      }
+    };
+
+    if (shouldRun) startMic();
+    else stopMic();
+
+    return () => stopMic();
+  }, [screen, micEnabled, canUseAV]);
+
+  // Second key tracking
+  useEffect(() => {
+    const count = keysTaken.filter(Boolean).length;
+    if (count === 2 && secondKeyTimeRef.current === null) {
+      secondKeyTimeRef.current = Date.now();
+    }
+  }, [keysTaken]);
+
+  // Panic checker
+  useEffect(() => {
+    if (screen !== "PLAY") return;
+
+    const t = setInterval(() => {
+      const secondKeyAt = secondKeyTimeRef.current;
+      if (!secondKeyAt) return;
+
+      const now = Date.now();
+      const p = panicRef.current;
+
+      if (!p.active && now - secondKeyAt >= PANIC_DELAY_MS) {
+        const endsAt = now + PANIC_DURATION_MS;
+        setPanic({ active: true, startsAt: now, endsAt });
+        safeSetVolume(panicSndRef.current, 0.85);
+
+        const pl = playerRef.current;
+        const fi = floorIndexRef.current;
+        const f = floorsRef.current[fi];
+
+        const extra = [];
+        for (let i = 0; i < PANIC_EXTRA_ENEMIES; i++) {
+          const ang = (Math.PI * 2 * i) / PANIC_EXTRA_ENEMIES;
+          const rx = clamp(pl.x + Math.cos(ang) * 160, ENEMY_R, WORLD_W - ENEMY_R);
+          const ry = clamp(pl.y + Math.sin(ang) * 160, ENEMY_R, WORLD_H - ENEMY_R);
+          // ensure spawned enemy not inside a wall
+          if (!isCircleInsideWall(rx, ry, ENEMY_R, f.walls)) {
+            extra.push({
+              x: rx,
+              y: ry,
+              patrol: [{ x: rx, y: ry }, { x: rx + 20, y: ry + 20 }],
+              patrolIndex: 1,
+              kind: "PANIC",
+            });
+          }
+        }
+        enemiesRef.current = [...enemiesRef.current, ...extra];
+      }
+
+      if (p.active && now >= p.endsAt) {
+        setPanic({ active: false, startsAt: 0, endsAt: 0 });
+        safeSetVolume(panicSndRef.current, 0.0);
+        enemiesRef.current = enemiesRef.current.filter((e) => e.kind !== "PANIC");
+      }
+    }, 250);
+
+    return () => clearInterval(t);
+  }, [screen]);
+
+  /* =========================
+     MAIN LOOP: FIXED TIME STEP
+     This removes "big jumps" and makes movement smooth and consistent.
+  ========================= */
+  useEffect(() => {
+    if (screen !== "PLAY") return;
+
+    let raf = null;
+    let last = performance.now ? performance.now() : Date.now();
+    let acc = 0;
+
+    const STEP = 1000 / 60; // 60Hz
+    const MAX_ACC = 250; // clamp to avoid huge dt after lag spikes
+
+    const cancelCapture = () => {
+      captureRef.current = null;
+      setCaptureUI({ visible: false, type: null, progress01: 0 });
+    };
+
+    const simulate = (stepMs) => {
+      const dt = stepMs / 1000;
+
+      const fi = floorIndexRef.current;
+      const f = floorsRef.current[fi];
+      const walls = f.walls;
+
+      // PLAYER
+      const mv = moveRef.current;
+      const p0 = playerRef.current;
+
+      let vx = 0;
+      let vy = 0;
+      if (mv.left) vx -= 1;
+      if (mv.right) vx += 1;
+      if (mv.up) vy -= 1;
+      if (mv.down) vy += 1;
+
+      if (vx !== 0 && vy !== 0) {
+        vx *= 0.7071;
+        vy *= 0.7071;
+      }
+
+      let nx = p0.x + vx * PLAYER_SPD * dt;
+      let ny = p0.y + vy * PLAYER_SPD * dt;
+
+      nx = clamp(nx, PLAYER_R, WORLD_W - PLAYER_R);
+      ny = clamp(ny, PLAYER_R, WORLD_H - PLAYER_R);
+
+      for (const w of walls) {
+        if (circleRectCollide(nx, ny, PLAYER_R, w.x, w.y, w.w, w.h)) {
+          const tryX = p0.x + vx * PLAYER_SPD * dt;
+          if (!circleRectCollide(tryX, p0.y, PLAYER_R, w.x, w.y, w.w, w.h)) {
+            nx = tryX;
+            ny = p0.y;
+          } else {
+            const tryY = p0.y + vy * PLAYER_SPD * dt;
+            if (!circleRectCollide(p0.x, tryY, PLAYER_R, w.x, w.y, w.w, w.h)) {
+              nx = p0.x;
+              ny = tryY;
+            } else {
+              nx = p0.x;
+              ny = p0.y;
+            }
+          }
+        }
+      }
+
+      playerRef.current = { x: nx, y: ny };
+
+      // ENEMIES
+      const loud = canUseAV && micEnabled && micDbRef.current > MIC_THRESHOLD_DB;
+      const pl = playerRef.current;
+
+      for (const e of enemiesRef.current) {
+        let speed = ENEMY_SPD;
+        let tx;
+        let ty;
+
+        if (loud && dist(pl.x, pl.y, e.x, e.y) <= MIC_LURE_RADIUS) {
+          speed *= MIC_ENEMY_SPEED_BOOST;
+          tx = pl.x;
+          ty = pl.y;
+        } else {
+          const target = e.patrol[e.patrolIndex];
+          const d = dist(e.x, e.y, target.x, target.y);
+          if (d < 10) e.patrolIndex = e.patrolIndex === 0 ? 1 : 0;
+          const t2 = e.patrol[e.patrolIndex];
+          tx = t2.x;
+          ty = t2.y;
+        }
+
+        const dx = tx - e.x;
+        const dy = ty - e.y;
+        const mag = Math.max(0.0001, Math.sqrt(dx * dx + dy * dy));
+        const ux = dx / mag;
+        const uy = dy / mag;
+
+        let ex = e.x + ux * speed * dt;
+        let ey = e.y + uy * speed * dt;
+
+        let blocked = false;
+        for (const w of walls) {
+          if (circleRectCollide(ex, ey, ENEMY_R, w.x, w.y, w.w, w.h)) {
+            blocked = true;
+            break;
+          }
+        }
+        if (!blocked) {
+          e.x = clamp(ex, ENEMY_R, WORLD_W - ENEMY_R);
+          e.y = clamp(ey, ENEMY_R, WORLD_H - ENEMY_R);
+        }
+      }
+
+      // Steps volume
+      if (canUseAV) {
+        const nearest = enemiesRef.current.reduce((best, e) => Math.min(best, dist(pl.x, pl.y, e.x, e.y)), Infinity);
+        const vol = nearest < 260 ? clamp(1 - nearest / 260, 0, 1) * 0.85 : 0;
+        safeSetVolume(stepsRef.current, vol);
+      }
+
+      // HIT
+      const now = Date.now();
+      if (now - lastHitRef.current > ENEMY_HIT_COOLDOWN_MS) {
+        for (const e of enemiesRef.current) {
+          if (dist(pl.x, pl.y, e.x, e.y) < PLAYER_R + ENEMY_R - 2) {
+            lastHitRef.current = now;
+            cancelCapture();
+            const nh = heartsRef.current - 1;
+            heartsRef.current = nh;
+            setHearts(nh);
+            if (nh <= 0) setScreen("LOSE");
+            break;
+          }
+        }
+      }
+
+      // CAPTURE
+      const cap = captureRef.current;
+      if (cap) {
+        const elapsed = now - cap.startedAt;
+        const progress01 = clamp(elapsed / cap.durationMs, 0, 1);
+
+        const kt = keysTakenRef.current;
+        const keyAvailable = !kt[fi];
+        const bandageAvailable = !f.bandage.taken;
+
+        const nearKey = keyAvailable && dist(pl.x, pl.y, f.key.x, f.key.y) < INTERACT_RADIUS;
+        const nearBandage = bandageAvailable && dist(pl.x, pl.y, f.bandage.x, f.bandage.y) < INTERACT_RADIUS;
+        const stillNear = cap.type === "KEY" ? nearKey : nearBandage;
+
+        if (!stillNear) {
+          cancelCapture();
+        } else {
+          setCaptureUI({ visible: true, type: cap.type, progress01 });
+
+          if (progress01 >= 1) {
+            if (cap.type === "KEY") {
+              setKeysTaken((prev) => {
+                const next = [...prev];
+                next[fi] = true;
+                keysTakenRef.current = next;
+                return next;
+              });
+            } else {
+              f.bandage.taken = true;
+              const nh = clamp(heartsRef.current + 1, 0, MAX_HEARTS);
+              heartsRef.current = nh;
+              setHearts(nh);
+            }
+            cancelCapture();
+          }
+        }
+      }
+    };
+
+    const tick = () => {
+      const now = performance.now ? performance.now() : Date.now();
+      let frame = now - last;
+      last = now;
+
+      if (elevatorBusy) {
+        raf = requestAnimationFrame(tick);
+        return;
+      }
+
+      frame = clamp(frame, 0, MAX_ACC);
+      acc += frame;
+
+      while (acc >= STEP) {
+        simulate(STEP);
+        acc -= STEP;
+      }
+
+      // render current player each frame for smooth visual feedback
+      setPlayer(playerRef.current);
+
+      raf = requestAnimationFrame(tick);
+    };
+
+    raf = requestAnimationFrame(tick);
+    return () => raf && cancelAnimationFrame(raf);
+  }, [screen, canUseAV, micEnabled, elevatorBusy]);
+
+  // Derived proximity for UI
+  const kt = keysTaken;
+  const pl = player;
+  const keyAvailable = !kt[floorIndex];
+  const bandageAvailable = !currentFloor.bandage.taken;
+
+  const nearKey = keyAvailable && dist(pl.x, pl.y, currentFloor.key.x, currentFloor.key.y) < INTERACT_RADIUS;
+  const nearBandage = bandageAvailable && dist(pl.x, pl.y, currentFloor.bandage.x, currentFloor.bandage.y) < INTERACT_RADIUS;
+
+  const inElevator = aabbOverlap(
+    pl.x - PLAYER_R,
+    pl.y - PLAYER_R,
+    PLAYER_R * 2,
+    PLAYER_R * 2,
+    currentFloor.elevator.x,
+    currentFloor.elevator.y,
+    currentFloor.elevator.w,
+    currentFloor.elevator.h
+  );
+
+  const enemiesToRender = enemiesRef.current.filter((e) => dist(pl.x, pl.y, e.x, e.y) <= ENEMY_SHOW_RADIUS);
+
+  // CAPTURE
+  const canCapture = !elevatorBusy && (nearKey || nearBandage);
+  const captureLabel = nearKey ? "CAPTURE KEY" : nearBandage ? "CAPTURE BANDAGE" : "CAPTURE";
+
+  const onCaptureDown = () => {
+    if (!canCapture) return;
+    if (captureRef.current) return;
+
+    if (nearKey) {
+      captureRef.current = { type: "KEY", startedAt: Date.now(), durationMs: KEY_HOLD_MS };
+      setCaptureUI({ visible: true, type: "KEY", progress01: 0 });
+    } else if (nearBandage) {
+      captureRef.current = { type: "BANDAGE", startedAt: Date.now(), durationMs: BANDAGE_HOLD_MS };
+      setCaptureUI({ visible: true, type: "BANDAGE", progress01: 0 });
+    }
+  };
+  const onCaptureUp = () => {
+    if (!captureRef.current) return;
+    captureRef.current = null;
+    setCaptureUI({ visible: false, type: null, progress01: 0 });
+  };
+
+  // Elevator + doors
+  const allKeys = keysTaken.filter(Boolean).length === 4;
+
+  const animateTo = (toValue, duration) =>
+    new Promise((resolve) => {
+      Animated.timing(doorsProgress, {
+        toValue,
+        duration,
+        easing: Easing.inOut(Easing.cubic),
+        useNativeDriver: true,
+      }).start(() => resolve());
+    });
+
+  const elevatorSequence = async () => {
+    if (!inElevator) return;
+    if (panicRef.current.active) return;
+    if (elevatorBusy) return;
+
+    if (captureRef.current) {
+      captureRef.current = null;
+      setCaptureUI({ visible: false, type: null, progress01: 0 });
+    }
+
+    setElevatorBusy(true);
+    setDoorsVisible(true);
+
+    try {
+      setDoorsLabel("DOORS CLOSING");
+      await animateTo(1, 520);
+
+      if (allKeys) {
+        setDoorsLabel("ESCAPING");
+        await new Promise((r) => setTimeout(r, 450));
+        setScreen("WIN");
+        return;
+      }
+
+      setDoorsLabel("MOVING");
+      await new Promise((r) => setTimeout(r, 500));
+
+      const current = floorIndexRef.current;
+      const options = [0, 1, 2, 3].filter((i) => i !== current);
+      const next = options[Math.floor(Math.random() * options.length)];
+      setFloorIndex(next);
+
+      await new Promise((r) => setTimeout(r, 90));
+
+      setDoorsLabel("DOORS OPENING");
+      await animateTo(0, 520);
+
+      setDoorsVisible(false);
+      setDoorsLabel("ELEVATOR");
+    } finally {
+      setElevatorBusy(false);
+    }
+  };
+
+  // Reset
+  const resetAll = () => {
+    floorsRef.current = buildFloors();
+    enemiesRef.current = [];
+    secondKeyTimeRef.current = null;
+
+    setKeysTaken([false, false, false, false]);
+    keysTakenRef.current = [false, false, false, false];
+
+    setHearts(MAX_HEARTS);
+    heartsRef.current = MAX_HEARTS;
+
+    setPanic({ active: false, startsAt: 0, endsAt: 0 });
+
+    setFloorIndex(0);
+    floorIndexRef.current = 0;
+
+    const f0 = floorsRef.current[0];
+    const safeSpawn = findNearestFreeSpawn(f0.spawn, f0.walls);
+    setPlayer(safeSpawn);
+    playerRef.current = safeSpawn;
+
+    moveRef.current = { up: false, down: false, left: false, right: false };
+
+    captureRef.current = null;
+    setCaptureUI({ visible: false, type: null, progress01: 0 });
+
+    setElevatorBusy(false);
+    doorsProgress.setValue(0);
+    setDoorsVisible(false);
+    setDoorsLabel("ELEVATOR");
+  };
+
+  const startGame = () => {
+    resetAll();
+    setScreen("PLAY");
+  };
+
+  const hintText = (() => {
+    if (elevatorBusy) return "Elevator in use...";
+    if (captureUI.visible) return "Capturing... keep holding";
+    if (nearKey) return "Hold CAPTURE to take the key (5 seconds)";
+    if (nearBandage) return "Hold CAPTURE to take the bandage";
+    if (inElevator) return allKeys ? "Press ELEVATOR to escape" : "Press ELEVATOR to travel (random)";
+    return "Stay quiet. Run if you hear steps";
+  })();
+
+  const panicRemaining = panic.active ? Math.max(0, panic.endsAt - Date.now()) : 0;
+  const panicSec = Math.ceil(panicRemaining / 1000);
+
+  // Screens
+  if (screen === "HOME") {
+    return (
+      <HomeScreen
+        selectedCharId={selectedCharId}
+        setSelectedCharId={setSelectedCharId}
+        micEnabled={micEnabled}
+        setMicEnabled={setMicEnabled}
+        canUseAV={canUseAV}
+        onStart={startGame}
+        onRules={() => setScreen("RULES")}
+      />
+    );
+  }
+
+  if (screen === "RULES") return <RulesScreen onBack={() => setScreen("HOME")} />;
+
+  if (screen === "LOSE") {
+    return (
+      <SafeAreaView style={[styles.full, { backgroundColor: "black", justifyContent: "center", alignItems: "center" }]}>
+        <Text style={styles.endTitle}>YOU LOST</Text>
+        <Text style={styles.endSub}>Your hearts reached zero.</Text>
+        <View style={{ height: 14 }} />
+        <TouchableOpacity onPress={() => setScreen("HOME")} style={styles.primaryBtn}>
+          <Text style={styles.primaryBtnText}>Back to Home</Text>
+        </TouchableOpacity>
+      </SafeAreaView>
+    );
+  }
+
+  if (screen === "WIN") {
+    return (
+      <SafeAreaView style={[styles.full, { backgroundColor: "#050608", justifyContent: "center", alignItems: "center" }]}>
+        <Text style={styles.endTitle}>YOU ESCAPED</Text>
+        <Text style={styles.endSub}>All keys collected.</Text>
+        <View style={{ height: 14 }} />
+        <TouchableOpacity onPress={() => setScreen("HOME")} style={styles.primaryBtn}>
+          <Text style={styles.primaryBtnText}>Back to Home</Text>
+        </TouchableOpacity>
+      </SafeAreaView>
+    );
+  }
+
+  // PLAY UI
+  return (
+    <SafeAreaView style={[styles.full, { backgroundColor: theme.bg }]}>
+      {/* HUD */}
+      <View style={[styles.hud, { height: HUD_H }]}>
+        <View style={{ gap: 6 }}>
+          <Text style={styles.hudTitle}>THE LAST FLOOR</Text>
+          <Text style={styles.hudSub}>UNKNOWN FLOOR</Text>
+          <Text style={styles.hudTiny}>
+            Keys: {keysTaken.filter(Boolean).length}/4 {canUseAV && micEnabled ? ` | MIC ${Math.round(micDb)} dB` : ""}
+          </Text>
+        </View>
+        <View style={{ alignItems: "flex-end", gap: 8 }}>
+          <HeartRow hearts={hearts} />
+          {panic.active ? <Text style={styles.panicText}>LOCKDOWN {panicSec}s</Text> : <Text style={styles.smallHint}>No combat</Text>}
+        </View>
+      </View>
+
+      {/* WORLD VIEWPORT (flexible) */}
+      <View style={[styles.viewport, { flex: 1 }]}>
+        <View
+          style={{
+            width: WORLD_W * ZOOM,
+            height: WORLD_H * ZOOM,
+            transform: [{ translateX: camera.translateX }, { translateY: camera.translateY }],
+          }}
+        >
+          <View style={{ position: "absolute", left: 0, top: 0, width: WORLD_W * ZOOM, height: WORLD_H * ZOOM }}>
+            {currentFloor.walls.map((w, i) => (
+              <View
+                key={`w-${i}`}
+                style={{
+                  position: "absolute",
+                  left: w.x * ZOOM,
+                  top: w.y * ZOOM,
+                  width: w.w * ZOOM,
+                  height: w.h * ZOOM,
+                  backgroundColor: theme.wall,
+                  borderWidth: 1,
+                  borderColor: theme.edge,
+                  borderRadius: 10,
+                }}
+              />
+            ))}
+
+            {/* Elevator */}
+            <View
+              style={{
+                position: "absolute",
+                left: currentFloor.elevator.x * ZOOM,
+                top: currentFloor.elevator.y * ZOOM,
+                width: currentFloor.elevator.w * ZOOM,
+                height: currentFloor.elevator.h * ZOOM,
+                backgroundColor: "rgba(255,255,255,0.06)",
+                borderWidth: 2,
+                borderColor: inElevator ? theme.accent : "rgba(255,255,255,0.18)",
+                borderRadius: 14,
+                justifyContent: "center",
+                alignItems: "center",
+              }}
+            >
+              <Text style={{ color: "rgba(255,255,255,0.85)", fontWeight: "900", fontSize: 12 }}>ELEVATOR</Text>
+            </View>
+
+            {/* Key */}
+            {keyAvailable ? (
+              <View
+                style={{
+                  position: "absolute",
+                  left: (currentFloor.key.x - 12) * ZOOM,
+                  top: (currentFloor.key.y - 12) * ZOOM,
+                  width: 24 * ZOOM,
+                  height: 24 * ZOOM,
+                  borderRadius: 10,
+                  backgroundColor: theme.accent,
+                  opacity: nearKey ? 1 : 0.85,
+                  justifyContent: "center",
+                  alignItems: "center",
+                }}
+              >
+                <Text style={{ color: "white", fontWeight: "900" }}>K</Text>
+              </View>
+            ) : null}
+
+            {/* Bandage */}
+            {bandageAvailable ? (
+              <View
+                style={{
+                  position: "absolute",
+                  left: (currentFloor.bandage.x - 12) * ZOOM,
+                  top: (currentFloor.bandage.y - 12) * ZOOM,
+                  width: 24 * ZOOM,
+                  height: 24 * ZOOM,
+                  borderRadius: 10,
+                  backgroundColor: "#d9d9d9",
+                  opacity: nearBandage ? 1 : 0.85,
+                  justifyContent: "center",
+                  alignItems: "center",
+                }}
+              >
+                <Text style={{ color: "#111", fontWeight: "900" }}>+</Text>
+              </View>
+            ) : null}
+
+            {/* Enemies */}
+            {enemiesToRender.map((e, i) => (
+              <View
+                key={`e-${i}`}
+                style={{
+                  position: "absolute",
+                  left: (e.x - ENEMY_R) * ZOOM,
+                  top: (e.y - ENEMY_R) * ZOOM,
+                  width: ENEMY_R * 2 * ZOOM,
+                  height: ENEMY_R * 2 * ZOOM,
+                  borderRadius: 999,
+                  backgroundColor: e.kind === "PANIC" ? "rgba(255,60,160,0.78)" : "rgba(255,40,60,0.75)",
+                  borderWidth: 2,
+                  borderColor: "rgba(0,0,0,0.35)",
+                }}
+              />
+            ))}
+
+            {/* Player */}
+            <View
+              style={{
+                position: "absolute",
+                left: (player.x - PLAYER_R) * ZOOM,
+                top: (player.y - PLAYER_R) * ZOOM,
+                width: PLAYER_R * 2 * ZOOM,
+                height: PLAYER_R * 2 * ZOOM,
+                borderRadius: 999,
+                backgroundColor: char.color,
+                borderWidth: 3,
+                borderColor: char.ring,
+              }}
+            />
+
+            {/* Darkness */}
+            <View style={{ position: "absolute", left: 0, top: 0, width: WORLD_W * ZOOM, height: WORLD_H * ZOOM }} pointerEvents="none">
+              <Svg width={WORLD_W * ZOOM} height={WORLD_H * ZOOM}>
+                <Defs>
+                  <Mask id="mask">
+                    <Rect x="0" y="0" width="100%" height="100%" fill="white" />
+                    <Circle cx={player.x * ZOOM} cy={player.y * ZOOM} r={VISION_RADIUS * ZOOM} fill="black" />
+                  </Mask>
+                </Defs>
+                <Rect x="0" y="0" width="100%" height="100%" fill="rgba(0,0,0,0.70)" mask="url(#mask)" />
+              </Svg>
+            </View>
+
+            {panic.active ? (
+              <View
+                pointerEvents="none"
+                style={{
+                  position: "absolute",
+                  left: 0,
+                  top: 0,
+                  width: WORLD_W * ZOOM,
+                  height: WORLD_H * ZOOM,
+                  backgroundColor: "rgba(255,0,60,0.06)",
+                }}
+              />
+            ) : null}
+          </View>
+        </View>
+      </View>
+
+      {/* Hint */}
+      <View style={[styles.hintBox, { height: HINT_H }]}>
+        <Text style={styles.hintText} numberOfLines={2}>
+          {hintText}
+        </Text>
+      </View>
+
+      {/* Controls */}
+      <View style={[styles.controls, { height: CONTROLS_H, paddingBottom: SAFE_BOTTOM_PAD }]}>
+        <View style={styles.dirPad}>
+          <TouchableOpacity
+            disabled={elevatorBusy}
+            style={[styles.btn, { opacity: elevatorBusy ? 0.45 : 1 }]}
+            onPressIn={() => (moveRef.current.up = true)}
+            onPressOut={() => (moveRef.current.up = false)}
+          >
+            <Text style={styles.btnText}>↑</Text>
+          </TouchableOpacity>
+
+          <View style={{ flexDirection: "row", gap: 12 }}>
+            <TouchableOpacity
+              disabled={elevatorBusy}
+              style={[styles.btn, { opacity: elevatorBusy ? 0.45 : 1 }]}
+              onPressIn={() => (moveRef.current.left = true)}
+              onPressOut={() => (moveRef.current.left = false)}
+            >
+              <Text style={styles.btnText}>←</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              disabled={elevatorBusy}
+              style={[styles.btn, { opacity: elevatorBusy ? 0.45 : 1 }]}
+              onPressIn={() => (moveRef.current.right = true)}
+              onPressOut={() => (moveRef.current.right = false)}
+            >
+              <Text style={styles.btnText}>→</Text>
+            </TouchableOpacity>
+          </View>
+
+          <TouchableOpacity
+            disabled={elevatorBusy}
+            style={[styles.btn, { opacity: elevatorBusy ? 0.45 : 1 }]}
+            onPressIn={() => (moveRef.current.down = true)}
+            onPressOut={() => (moveRef.current.down = false)}
+          >
+            <Text style={styles.btnText}>↓</Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={{ gap: 10, alignItems: "flex-end" }}>
+          <TouchableOpacity
+            disabled={!canCapture}
+            style={[
+              styles.btnBig,
+              {
+                borderColor: canCapture ? theme.accent : "rgba(255,255,255,0.18)",
+                opacity: canCapture ? 1 : 0.45,
+              },
+            ]}
+            onPressIn={onCaptureDown}
+            onPressOut={onCaptureUp}
+          >
+            <Text style={styles.btnText}>{captureLabel}</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            disabled={!inElevator || panic.active || elevatorBusy}
+            style={[
+              styles.btnBig,
+              {
+                borderColor: inElevator && !panic.active && !elevatorBusy ? theme.accent : "rgba(255,255,255,0.18)",
+                opacity: inElevator && !panic.active && !elevatorBusy ? 1 : 0.45,
+              },
+            ]}
+            onPress={elevatorSequence}
+          >
+            <Text style={styles.btnText}>{allKeys ? "ESCAPE" : "ELEVATOR"}</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            disabled={elevatorBusy}
+            style={[styles.btnBig, { opacity: elevatorBusy ? 0.45 : 0.95 }]}
+            onPress={() => setScreen("HOME")}
+          >
+            <Text style={styles.btnText}>QUIT</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+
+      <CaptureOverlay
+        visible={captureUI.visible}
+        title={captureUI.type === "KEY" ? "CAPTURING KEY" : "CAPTURING BANDAGE"}
+        progress01={captureUI.progress01}
+        accent={theme.accent}
+      />
+
+      <ElevatorDoorsOverlay visible={doorsVisible} progress={doorsProgress} label={doorsLabel} />
+    </SafeAreaView>
+  );
+}
+
+/* =========================
+   STYLES
+========================= */
+const styles = StyleSheet.create({
+  full: { flex: 1 },
+
+  safePad: {
+    flex: 1,
+    paddingHorizontal: 18,
+    paddingTop: 8,
+    paddingBottom: 18,
+  },
+
+  homeTitle: { color: "white", fontSize: 28, fontWeight: "900" },
+  homeSub: { color: "rgba(255,255,255,0.65)", marginTop: 6 },
+
+  warnText: {
+    color: "rgba(255,180,180,0.85)",
+    marginTop: 10,
+    lineHeight: 18,
+    fontSize: 12,
+  },
+
+  sectionTitle: { color: "rgba(255,255,255,0.85)", fontWeight: "900", marginTop: 18 },
+
+  charRow: { flexDirection: "row", gap: 12, marginTop: 12 },
+
+  card: {
+    flex: 1,
+    padding: 14,
+    borderRadius: 16,
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderWidth: 2,
+  },
+
+  avatar: {
+    width: 54,
+    height: 54,
+    borderRadius: 999,
+    borderWidth: 3,
+    marginBottom: 10,
+  },
+
+  cardTitle: { color: "white", fontWeight: "800" },
+  cardSub: { color: "rgba(255,255,255,0.55)", fontSize: 12, marginTop: 4 },
+
+  rowBetween: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", gap: 12 },
+
+  muted: { color: "rgba(255,255,255,0.75)" },
+
+  toggle: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
+  },
+  toggleText: { color: "white", fontWeight: "900" },
+
+  primaryBtn: {
+    height: 52,
+    borderRadius: 16,
+    backgroundColor: "rgba(59,108,255,0.22)",
+    borderWidth: 1,
+    borderColor: "rgba(59,108,255,0.55)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  primaryBtnText: { color: "white", fontWeight: "900", fontSize: 15 },
+
+  secondaryBtn: {
+    height: 52,
+    borderRadius: 16,
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.14)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  secondaryBtnText: { color: "white", fontWeight: "900", fontSize: 15 },
+
+  rulesTitle: { color: "white", fontSize: 22, fontWeight: "900" },
+  rulesText: { color: "rgba(255,255,255,0.68)", marginTop: 12, lineHeight: 20 },
+
+  endTitle: { color: "white", fontSize: 26, fontWeight: "900" },
+  endSub: { color: "rgba(255,255,255,0.65)", fontSize: 14 },
+
+  hud: {
+    paddingHorizontal: 14,
+    paddingTop: 10,
+    paddingBottom: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  hudTitle: { color: "white", fontSize: 16, fontWeight: "900" },
+  hudSub: { color: "rgba(255,255,255,0.62)", fontSize: 12, marginTop: 2 },
+  hudTiny: { color: "rgba(255,255,255,0.55)", fontSize: 11 },
+
+  viewport: {
+    width: "100%",
+    overflow: "hidden",
+    borderTopWidth: 1,
+    borderBottomWidth: 1,
+    borderColor: "rgba(255,255,255,0.06)",
+  },
+
+  hintBox: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    backgroundColor: "rgba(0,0,0,0.35)",
+    justifyContent: "center",
+  },
+  hintText: { color: "rgba(255,255,255,0.75)", fontSize: 12 },
+
+  controls: {
+    paddingHorizontal: 14,
+    paddingTop: 10,
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    backgroundColor: "#05070b",
+  },
+
+  dirPad: { gap: 12, alignItems: "center" },
+
+  btn: {
+    width: 58,
+    height: 46,
+    borderRadius: 12,
+    backgroundColor: "#121a2a",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  btnBig: {
+    width: 160,
+    height: 52,
+    borderRadius: 14,
+    backgroundColor: "#121a2a",
+    borderWidth: 2,
+    borderColor: "rgba(255,255,255,0.18)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  btnText: { color: "white", fontWeight: "900", fontSize: 14 },
+
+  heart: {
+    width: 14,
+    height: 14,
+    borderRadius: 4,
+    backgroundColor: "#ff3355",
+  },
+
+  smallHint: { color: "rgba(255,255,255,0.6)", fontSize: 11, textAlign: "right" },
+  panicText: { color: "rgba(255,180,200,0.92)", fontSize: 11, fontWeight: "900", textAlign: "right" },
+
+  captureWrap: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    top: 0,
+    bottom: 0,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  captureCard: {
+    width: 220,
+    paddingVertical: 16,
+    paddingHorizontal: 14,
+    borderRadius: 18,
+    backgroundColor: "rgba(0,0,0,0.72)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
+    alignItems: "center",
+  },
+  captureTitle: { color: "white", fontWeight: "900", fontSize: 14, letterSpacing: 0.4 },
+  capturePct: { color: "white", fontWeight: "900", fontSize: 16 },
+  captureSub: { color: "rgba(255,255,255,0.65)", marginTop: 2, fontSize: 12 },
+
+  doorsWrap: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    top: 0,
+    bottom: 0,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  doorPanel: {
+    position: "absolute",
+    top: 0,
+    bottom: 0,
+    width: "55%",
+    backgroundColor: "#050508",
+    borderColor: "rgba(255,255,255,0.10)",
+    borderWidth: 1,
+  },
+  doorLeft: { left: 0 },
+  doorRight: { right: 0 },
+  doorShade: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    top: 0,
+    bottom: 0,
+    backgroundColor: "black",
+  },
+  doorLabelWrap: {
+    position: "absolute",
+    top: 80,
+    alignSelf: "center",
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 14,
+    backgroundColor: "rgba(0,0,0,0.55)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
+  },
+  doorLabel: { color: "white", fontWeight: "900", letterSpacing: 0.4 },
+});

@@ -1,0 +1,1393 @@
+// THE LAST FLOOR — v2
+// ▸ Ghost territory zones: each ghost patrols its own zone; enters ALERT then CHASE when player crosses zone edge
+// ▸ Advanced background: tiled floor texture + atmospheric vignette + animated dust particles
+// ▸ Better walls: layered inner-shadow, edge glow, corner rivets, grunge lines
+// Paste into Expo Snack: snack.expo.dev
+
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import {
+  View, Text, TouchableOpacity, StyleSheet, Animated,
+  Dimensions, StatusBar, Vibration, ScrollView,
+  SafeAreaView, Platform, Alert, Easing,
+} from 'react-native';
+import Svg, { Path, Circle, Ellipse, Rect, G, Defs, Mask, RadialGradient, Stop, Line } from 'react-native-svg';
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SAFE expo-av
+// ─────────────────────────────────────────────────────────────────────────────
+const ExpoAV = (() => { try { return require('expo-av'); } catch { return null; } })();
+const Audio = ExpoAV?.Audio ?? null;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WORLD CONFIG
+// ─────────────────────────────────────────────────────────────────────────────
+const WORLD_W = 1400;
+const WORLD_H = 900;
+
+const PLAYER_R   = 18;
+const PLAYER_SPD = 4.1;
+const ENEMY_R    = 24;
+
+// Ghost AI speeds per state
+const GHOST_SPD_PATROL = 1.6;   // calm patrolling inside zone
+const GHOST_SPD_ALERT  = 2.2;   // noticed player — moving toward edge
+const GHOST_SPD_CHASE  = 3.4;   // actively chasing
+
+// Detection radii
+const GHOST_ZONE_SENSE  = 160;  // player entering zone triggers ALERT
+const GHOST_CHASE_RANGE = 260;  // once alert, if player this close → CHASE
+const GHOST_FORGET_DIST = 380;  // player this far → ghost returns to patrol
+const GHOST_ALERT_LINGER = 3000; // ms ghost stays ALERT after losing sight
+
+const ENEMY_HIT_COOLDOWN_MS = 900;
+const VISION_RADIUS         = 220;
+const ENEMY_SHOW_RADIUS     = 260;
+const INTERACT_RADIUS       = 70;
+
+const KEY_HOLD_MS     = 5000;
+const BANDAGE_HOLD_MS = 2500;
+const MAX_HEARTS      = 3;
+
+const PANIC_DELAY_MS    = 5 * 60 * 1000;
+const PANIC_DURATION_MS = 60 * 1000;
+const PANIC_EXTRA_ENEMIES = 3;
+
+const MIC_ENABLED_DEFAULT = true;
+const MIC_POLL_MS         = 220;
+const MIC_THRESHOLD_DB    = -28;
+const MIC_LURE_RADIUS     = 340;
+const MIC_ENEMY_SPD_BOOST = 1.4;
+
+const SOUND_URLS = {
+  ambience: 'https://cdn.pixabay.com/download/audio/2022/03/15/audio_2e5b4f6c6d.mp3?filename=dark-ambient-110997.mp3',
+  panic:    'https://cdn.pixabay.com/download/audio/2022/10/30/audio_5b8b1b0d65.mp3?filename=horror-swell-124320.mp3',
+  steps:    'https://cdn.pixabay.com/download/audio/2022/03/15/audio_613a4d17f0.mp3?filename=footsteps-on-wood-110997.mp3',
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  THEMES  (richer colors for background layers)
+// ─────────────────────────────────────────────────────────────────────────────
+const THEMES = [
+  {
+    title:'THE MAZE',
+    bg:'#030c06',       // deep dark base
+    bg2:'#071410',      // secondary bg layer
+    tile:'#061209',     // floor tile color
+    tileAlt:'#07150b',  // alternating tile
+    wall:'#0d1f10',     // wall fill
+    wallInner:'#050e07',// wall inner shadow
+    wallGlow:'#1e5525', // wall edge glow
+    edge:'#1a4820',     // wall border
+    accent:'#3bd46a',
+    vignette:'rgba(0,0,0,0.72)',
+    dust:'rgba(60,200,90,0.06)',
+    alertColor:'#ffcc00',
+    chaseColor:'#ff2244',
+  },
+  {
+    title:'THE UPPER FLOOR',
+    bg:'#03040e',
+    bg2:'#060a1a',
+    tile:'#050818',
+    tileAlt:'#060a1c',
+    wall:'#0b1030',
+    wallInner:'#040614',
+    wallGlow:'#1c2a70',
+    edge:'#1a2260',
+    accent:'#3b6cff',
+    vignette:'rgba(0,0,0,0.74)',
+    dust:'rgba(60,90,255,0.05)',
+    alertColor:'#ffcc00',
+    chaseColor:'#ff2244',
+  },
+  {
+    title:'THE ATTIC',
+    bg:'#0d0306',
+    bg2:'#180510',
+    tile:'#120408',
+    tileAlt:'#14040a',
+    wall:'#220a14',
+    wallInner:'#0e0308',
+    wallGlow:'#5a1a30',
+    edge:'#481428',
+    accent:'#ff3b8d',
+    vignette:'rgba(0,0,0,0.76)',
+    dust:'rgba(255,50,120,0.05)',
+    alertColor:'#ffcc00',
+    chaseColor:'#ff4400',
+  },
+  {
+    title:'NO ESCAPE',
+    bg:'#0c0001',
+    bg2:'#1a0003',
+    tile:'#0f0102',
+    tileAlt:'#110102',
+    wall:'#2a0006',
+    wallInner:'#0a0001',
+    wallGlow:'#801020',
+    edge:'#660012',
+    accent:'#ff3b3b',
+    vignette:'rgba(0,0,0,0.78)',
+    dust:'rgba(255,0,30,0.06)',
+    alertColor:'#ff8800',
+    chaseColor:'#ff0000',
+  },
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  CHARACTER PALETTES
+// ─────────────────────────────────────────────────────────────────────────────
+const SKINS   = [{l:'Ivory',c:'#fde8cc'},{l:'Cream',c:'#f5cda0'},{l:'Warm',c:'#e8a870'},{l:'Tan',c:'#c47830'},{l:'Mocha',c:'#8a4a18'}];
+const HAIRS   = [{l:'Jet',c:'#1a1008'},{l:'Brown',c:'#3a1a0a'},{l:'Chestnut',c:'#6a2e10'},{l:'Auburn',c:'#8c3a0a'},{l:'Caramel',c:'#c07830'},{l:'Honey',c:'#cc9828'},{l:'Platinum',c:'#e8dab8'},{l:'Ash',c:'#b0a890'},{l:'Red',c:'#8a1010'},{l:'Rose',c:'#cc3377'},{l:'Violet',c:'#6622aa'},{l:'Blue',c:'#1a55cc'}];
+const OUTFITS = [{l:'Navy',c:'#1a3a78'},{l:'Scarlet',c:'#882020'},{l:'Forest',c:'#1a5a2a'},{l:'Plum',c:'#6a1a78'},{l:'Gold',c:'#c49010'},{l:'Teal',c:'#0a5a5a'},{l:'Rose',c:'#aa2255'},{l:'Rust',c:'#8a3010'},{l:'Sky',c:'#1a6aaa'},{l:'Olive',c:'#5a6a20'}];
+const EYES    = [{l:'Dark',c:'#1a1010'},{l:'Hazel',c:'#7a5020'},{l:'Amber',c:'#aa7010'},{l:'Green',c:'#1a6a20'},{l:'Teal',c:'#0a6a60'},{l:'Blue',c:'#1a40aa'},{l:'Grey',c:'#4a5a6a'},{l:'Violet',c:'#5a2a8a'}];
+const BOY_STYLES  = ['Short','Spiky','Buzz','Side','Curly','Mohawk'];
+const GIRL_STYLES = ['Long','Ponytail','Pigtails','Bob','Bun','Wavy'];
+const GIRL_ACC    = [{l:'None',v:'none'},{l:'Bow',v:'bow'},{l:'Tiara',v:'tiara'},{l:'Band',v:'band'},{l:'Flower',v:'flower'}];
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  UTILITY
+// ─────────────────────────────────────────────────────────────────────────────
+function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+function dist(ax,ay,bx,by){const dx=ax-bx,dy=ay-by;return Math.sqrt(dx*dx+dy*dy);}
+function aabbOverlap(ax,ay,aw,ah,bx,by,bw,bh){return ax<bx+bw&&ax+aw>bx&&ay<by+bh&&ay+ah>by;}
+function circleRect(cx,cy,cr,rx,ry,rw,rh){const nx=clamp(cx,rx,rx+rw),ny=clamp(cy,ry,ry+rh),dx=cx-nx,dy=cy-ny;return dx*dx+dy*dy<cr*cr;}
+function dk(hex,a){if(!hex||hex[0]!=='#')return hex;const h=hex.replace('#',''),r=parseInt(h.slice(0,2),16),g=parseInt(h.slice(2,4),16),b=parseInt(h.slice(4,6),16),k=1-a;return `rgb(${Math.max(0,~~(r*k))},${Math.max(0,~~(g*k))},${Math.max(0,~~(b*k))})`;} 
+function lt(hex,a){if(!hex||hex[0]!=='#')return hex;const h=hex.replace('#',''),r=parseInt(h.slice(0,2),16),g=parseInt(h.slice(2,4),16),b=parseInt(h.slice(4,6),16);return `rgb(${Math.min(255,~~(r+(255-r)*a))},${Math.min(255,~~(g+(255-g)*a))},${Math.min(255,~~(b+(255-b)*a))})`;} 
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  AUDIO HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+async function safeLoadLoop(uri,vol=0.6){try{if(!Audio)return null;const{sound}=await Audio.Sound.createAsync({uri},{shouldPlay:false,isLooping:true,volume:vol});return sound;}catch{return null;}}
+async function safePlay(s){try{if(s)await s.playAsync();}catch{}}
+async function safeVol(s,v){try{if(s)await s.setVolumeAsync(clamp(v,0,1));}catch{}}
+async function safeUnload(s){try{if(s)await s.unloadAsync();}catch{}}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  FLOOR DATA
+//  Each enemy now has: zone {cx,cy,r} — the territory it guards
+//  States: 'patrol' | 'alert' | 'chase'
+// ─────────────────────────────────────────────────────────────────────────────
+function buildFloors(){
+  return [
+    {
+      id:1, theme:0,
+      walls:[
+        {x:0,y:0,w:WORLD_W,h:26},{x:0,y:WORLD_H-26,w:WORLD_W,h:26},{x:0,y:0,w:26,h:WORLD_H},{x:WORLD_W-26,y:0,w:26,h:WORLD_H},
+        {x:180,y:120,w:380,h:28},{x:180,y:120,w:28,h:320},{x:560,y:120,w:28,h:320},{x:240,y:410,w:320,h:28},
+        {x:720,y:220,w:460,h:28},{x:720,y:220,w:28,h:360},{x:320,y:620,w:520,h:28},
+      ],
+      elevator:{x:80,y:740,w:120,h:110},
+      key:{x:1060,y:170},
+      bandage:{x:520,y:720,taken:false},
+      enemies:[
+        {x:1080,y:500,patrol:[{x:950,y:420},{x:1250,y:580}],patrolIndex:0,kind:'NORMAL',
+         zone:{cx:1100,cy:500,r:200}, state:'patrol', alertUntil:0},
+        {x:340,y:240,patrol:[{x:240,y:160},{x:520,y:360}],patrolIndex:0,kind:'NORMAL',
+         zone:{cx:360,cy:260,r:180}, state:'patrol', alertUntil:0},
+      ],
+      spawn:{x:120,y:790},
+    },
+    {
+      id:2, theme:1,
+      walls:[
+        {x:0,y:0,w:WORLD_W,h:26},{x:0,y:WORLD_H-26,w:WORLD_W,h:26},{x:0,y:0,w:26,h:WORLD_H},{x:WORLD_W-26,y:0,w:26,h:WORLD_H},
+        {x:140,y:170,w:1060,h:26},{x:140,y:170,w:26,h:530},{x:1174,y:170,w:26,h:530},{x:140,y:674,w:1060,h:26},
+        {x:360,y:300,w:680,h:26},{x:360,y:300,w:26,h:250},{x:1014,y:300,w:26,h:250},{x:360,y:524,w:680,h:26},
+      ],
+      elevator:{x:1040,y:740,w:120,h:110},
+      key:{x:200,y:240},
+      bandage:{x:680,y:430,taken:false},
+      enemies:[
+        {x:600,y:300,patrol:[{x:400,y:200},{x:1100,y:640}],patrolIndex:0,kind:'NORMAL',
+         zone:{cx:660,cy:420,r:230}, state:'patrol', alertUntil:0},
+        {x:900,y:560,patrol:[{x:420,y:540},{x:960,y:580}],patrolIndex:0,kind:'NORMAL',
+         zone:{cx:700,cy:560,r:200}, state:'patrol', alertUntil:0},
+      ],
+      spawn:{x:1100,y:790},
+    },
+    {
+      id:3, theme:2,
+      walls:[
+        {x:0,y:0,w:WORLD_W,h:26},{x:0,y:WORLD_H-26,w:WORLD_W,h:26},{x:0,y:0,w:26,h:WORLD_H},{x:WORLD_W-26,y:0,w:26,h:WORLD_H},
+        {x:120,y:110,w:26,h:680},{x:220,y:110,w:26,h:680},{x:320,y:110,w:26,h:680},{x:420,y:110,w:26,h:680},
+        {x:520,y:110,w:26,h:680},{x:620,y:110,w:26,h:680},{x:720,y:110,w:26,h:680},{x:820,y:110,w:26,h:680},
+        {x:120,y:260,w:726,h:28},{x:220,y:430,w:726,h:28},{x:120,y:610,w:726,h:28},
+      ],
+      elevator:{x:80,y:60,w:120,h:110},
+      key:{x:1240,y:780},
+      bandage:{x:1040,y:120,taken:false},
+      enemies:[
+        {x:1080,y:500,patrol:[{x:900,y:200},{x:1300,y:750}],patrolIndex:0,kind:'NORMAL',
+         zone:{cx:1100,cy:480,r:260}, state:'patrol', alertUntil:0},
+        {x:1000,y:240,patrol:[{x:870,y:100},{x:1340,y:380}],patrolIndex:0,kind:'NORMAL',
+         zone:{cx:1100,cy:240,r:200}, state:'patrol', alertUntil:0},
+      ],
+      spawn:{x:120,y:120},
+    },
+    {
+      id:4, theme:3,
+      walls:[
+        {x:0,y:0,w:WORLD_W,h:26},{x:0,y:WORLD_H-26,w:WORLD_W,h:26},{x:0,y:0,w:26,h:WORLD_H},{x:WORLD_W-26,y:0,w:26,h:WORLD_H},
+        {x:160,y:120,w:1080,h:26},{x:160,y:120,w:26,h:650},{x:1214,y:120,w:26,h:650},{x:160,y:744,w:1080,h:26},
+        {x:360,y:280,w:680,h:26},{x:360,y:280,w:26,h:360},{x:1014,y:280,w:26,h:360},{x:360,y:614,w:680,h:26},{x:640,y:420,w:120,h:26},
+      ],
+      elevator:{x:640,y:60,w:120,h:110},
+      key:{x:640,y:820},
+      bandage:{x:240,y:820,taken:false},
+      enemies:[
+        {x:520,y:360,patrol:[{x:380,y:300},{x:990,y:420}],patrolIndex:0,kind:'NORMAL',
+         zone:{cx:690,cy:380,r:240}, state:'patrol', alertUntil:0},
+        {x:980,y:560,patrol:[{x:900,y:300},{x:1000,y:720}],patrolIndex:0,kind:'NORMAL',
+         zone:{cx:950,cy:520,r:210}, state:'patrol', alertUntil:0},
+      ],
+      spawn:{x:700,y:120},
+    },
+  ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ADVANCED FLOOR BACKGROUND  (tiled + atmospheric)
+// ─────────────────────────────────────────────────────────────────────────────
+function FloorBackground({ theme, zoom }) {
+  const TILE = 80; // world units per tile
+  const cols = Math.ceil(WORLD_W / TILE) + 1;
+  const rows = Math.ceil(WORLD_H / TILE) + 1;
+  const tiles = [];
+  for(let r=0;r<rows;r++){
+    for(let c=0;c<cols;c++){
+      const alt = (r+c)%2===0;
+      tiles.push(
+        <View key={`t${r}_${c}`} style={{
+          position:'absolute',
+          left:c*TILE*zoom, top:r*TILE*zoom,
+          width:TILE*zoom, height:TILE*zoom,
+          backgroundColor: alt ? theme.tile : theme.tileAlt,
+          borderWidth: 0.5,
+          borderColor:'rgba(255,255,255,0.025)',
+        }}/>
+      );
+    }
+  }
+  // grunge scratch lines (decorative, static)
+  const scratches = [
+    {x1:200,y1:80, x2:350,y2:140},
+    {x1:600,y1:300,x2:680,y2:280},
+    {x1:900,y1:600,x2:1000,y2:650},
+    {x1:400,y1:700,x2:500,y2:720},
+    {x1:1100,y1:200,x2:1200,y2:190},
+    {x1:750,y1:450,x2:820,y2:480},
+  ];
+  return (
+    <View style={{position:'absolute',left:0,top:0,width:WORLD_W*zoom,height:WORLD_H*zoom}}>
+      {tiles}
+      {/* Scratch / grunge lines */}
+      <Svg style={{position:'absolute',left:0,top:0}} width={WORLD_W*zoom} height={WORLD_H*zoom}>
+        {scratches.map((s,i)=>(
+          <Line key={i}
+            x1={s.x1*zoom} y1={s.y1*zoom} x2={s.x2*zoom} y2={s.y2*zoom}
+            stroke="rgba(255,255,255,0.04)" strokeWidth={zoom*1.5} strokeLinecap="round"/>
+        ))}
+        {/* Random dot "debris" */}
+        {[{x:180,y:340},{x:480,y:160},{x:820,y:550},{x:1050,y:400},{x:600,y:750},{x:1200,y:650},{x:300,y:700},{x:900,y:200}].map((d,i)=>(
+          <Circle key={`d${i}`} cx={d.x*zoom} cy={d.y*zoom} r={zoom*2.5} fill="rgba(255,255,255,0.035)"/>
+        ))}
+      </Svg>
+    </View>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ADVANCED WALL RENDERER
+// ─────────────────────────────────────────────────────────────────────────────
+function WallBlock({ w, theme, zoom }) {
+  const x=w.x*zoom, y=w.y*zoom, ww=w.w*zoom, hh=w.h*zoom;
+  const isThick = w.w>50 || w.h>50; // outer border walls are thick
+  const cornerR = isThick ? 0 : 6;
+  const glowOpacity = isThick ? 0.55 : 0.7;
+
+  return (
+    <View style={{position:'absolute', left:x, top:y, width:ww, height:hh}}>
+      {/* Base fill */}
+      <View style={{
+        position:'absolute', left:0, top:0, right:0, bottom:0,
+        backgroundColor:theme.wall,
+        borderRadius:cornerR,
+      }}/>
+      {/* Inner shadow (darker inset feel) */}
+      <View style={{
+        position:'absolute', left:2, top:2, right:2, bottom:2,
+        backgroundColor:theme.wallInner,
+        borderRadius:Math.max(0,cornerR-2),
+        opacity:0.5,
+      }}/>
+      {/* Top highlight edge */}
+      <View style={{
+        position:'absolute', left:0, top:0, right:0, height:2,
+        backgroundColor:theme.wallGlow,
+        opacity:0.35,
+        borderTopLeftRadius:cornerR,
+        borderTopRightRadius:cornerR,
+      }}/>
+      {/* Left highlight edge */}
+      <View style={{
+        position:'absolute', left:0, top:0, bottom:0, width:2,
+        backgroundColor:theme.wallGlow,
+        opacity:0.25,
+        borderTopLeftRadius:cornerR,
+        borderBottomLeftRadius:cornerR,
+      }}/>
+      {/* Outer border glow */}
+      <View style={{
+        position:'absolute', left:0, top:0, right:0, bottom:0,
+        borderRadius:cornerR,
+        borderWidth:isThick ? 2 : 1.5,
+        borderColor:theme.edge,
+        opacity:glowOpacity,
+      }}/>
+      {/* Corner rivets for non-border walls */}
+      {!isThick && ww>30*zoom && hh>30*zoom && <>
+        {[[3,3],[ww-7,3],[3,hh-7],[ww-7,hh-7]].map(([rx,ry],i)=>(
+          <View key={i} style={{
+            position:'absolute', left:rx, top:ry,
+            width:4, height:4, borderRadius:2,
+            backgroundColor:theme.wallGlow, opacity:0.5,
+          }}/>
+        ))}
+      </>}
+    </View>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GHOST SPRITE  (state-aware: patrol / alert / chase)
+// ─────────────────────────────────────────────────────────────────────────────
+function GhostSprite({ state, kind, zoom }) {
+  const isPanic = kind==='PANIC';
+  const bodyColor  = isPanic ? '#cc2288' : state==='chase' ? '#ff1133' : state==='alert' ? '#ff8800' : '#c8c0e8';
+  const glowColor  = isPanic ? 'rgba(200,30,130,0.4)' : state==='chase' ? 'rgba(255,10,40,0.45)' : state==='alert' ? 'rgba(255,140,0,0.35)' : 'rgba(160,140,220,0.18)';
+  const eyeColor   = state==='chase' ? '#ff0000' : state==='alert' ? '#ffcc00' : '#0a0820';
+  const r = ENEMY_R * zoom;
+
+  return (
+    <View style={{width:r*2.8, height:r*2.8, alignItems:'center', justifyContent:'center'}}>
+      {/* Zone pulse glow */}
+      <View style={{
+        position:'absolute',
+        width:r*2.8, height:r*2.8, borderRadius:r*1.4,
+        backgroundColor:glowColor,
+      }}/>
+      {/* Body */}
+      <Svg width={r*2} height={r*2.4} style={{position:'absolute'}}>
+        {/* Ghost body */}
+        <Path
+          d={`M${r*0.15},${r} Q${r*0.15},${r*0.1} ${r},${r*0.15} Q${r*1.85},${r*0.1} ${r*1.85},${r} L${r*1.85},${r*1.75} Q${r*1.6},${r*1.55} ${r*1.4},${r*1.75} Q${r*1.2},${r*1.95} ${r},${r*1.75} Q${r*0.8},${r*1.95} ${r*0.6},${r*1.75} Q${r*0.4},${r*1.55} ${r*0.15},${r*1.75} Z`}
+          fill={bodyColor}
+          opacity={0.93}
+        />
+        {/* Eyes */}
+        <Circle cx={r*0.68} cy={r*0.85} r={r*0.22} fill={eyeColor}/>
+        <Circle cx={r*1.32} cy={r*0.85} r={r*0.22} fill={eyeColor}/>
+        {/* Eye shine */}
+        <Circle cx={r*0.72} cy={r*0.8} r={r*0.08} fill="white" opacity={state==='patrol'?0.8:0.3}/>
+        <Circle cx={r*1.36} cy={r*0.8} r={r*0.08} fill="white" opacity={state==='patrol'?0.8:0.3}/>
+        {/* Mouth — changes per state */}
+        {state==='chase'
+          ? <Path d={`M${r*0.6},${r*1.15} Q${r},${r*1.45} ${r*1.4},${r*1.15}`} stroke="rgba(0,0,0,0.7)" strokeWidth={r*0.12} fill="none" strokeLinecap="round"/>
+          : state==='alert'
+          ? <Path d={`M${r*0.65},${r*1.2} L${r*1.35},${r*1.2}`} stroke="rgba(0,0,0,0.6)" strokeWidth={r*0.1} fill="none" strokeLinecap="round"/>
+          : <Path d={`M${r*0.65},${r*1.15} Q${r},${r*1.3} ${r*1.35},${r*1.15}`} stroke="rgba(0,0,0,0.5)" strokeWidth={r*0.1} fill="none" strokeLinecap="round"/>
+        }
+      </Svg>
+      {/* State badge */}
+      {state!=='patrol'&&(
+        <View style={{
+          position:'absolute', top:-r*0.5, alignSelf:'center',
+          backgroundColor: state==='chase'?'rgba(200,0,20,0.85)':'rgba(180,100,0,0.85)',
+          paddingHorizontal:4, paddingVertical:1, borderRadius:4,
+        }}>
+          <Text style={{color:'white',fontSize:r*0.55,fontWeight:'900',fontFamily:'monospace',letterSpacing:1}}>
+            {state==='chase'?'!':'?'}
+          </Text>
+        </View>
+      )}
+    </View>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GHOST TERRITORY ZONE RING  (visible faint circle on the floor)
+// ─────────────────────────────────────────────────────────────────────────────
+function GhostZoneRing({ zone, state, theme, zoom }) {
+  const cx=zone.cx*zoom, cy=zone.cy*zoom, r=zone.r*zoom;
+  const color = state==='chase' ? theme.chaseColor : state==='alert' ? theme.alertColor : theme.accent;
+  const opacity = state==='patrol' ? 0.07 : state==='alert' ? 0.18 : 0.28;
+  return (
+    <Svg style={{position:'absolute',left:0,top:0,pointerEvents:'none'}} width={WORLD_W*zoom} height={WORLD_H*zoom}>
+      <Circle cx={cx} cy={cy} r={r} fill="none" stroke={color} strokeWidth={zoom*2} opacity={opacity} strokeDasharray={`${zoom*12} ${zoom*8}`}/>
+      <Circle cx={cx} cy={cy} r={r*0.15} fill={color} opacity={opacity*0.8}/>
+    </Svg>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  CAPTURE OVERLAY
+// ─────────────────────────────────────────────────────────────────────────────
+function CaptureOverlay({visible,title,progress01,accent}){
+  if(!visible)return null;
+  const size=66,r=26,c=2*Math.PI*r,dashOffset=c*(1-clamp(progress01,0,1));
+  return(
+    <View style={SS.captureWrap} pointerEvents="none">
+      <View style={SS.captureCard}>
+        <Text style={SS.captureTitle}>{title}</Text>
+        <View style={{height:10}}/>
+        <Svg width={size} height={size}>
+          <Circle cx={size/2} cy={size/2} r={r} stroke="rgba(255,255,255,0.18)" strokeWidth="6" fill="none"/>
+          <Circle cx={size/2} cy={size/2} r={r} stroke={accent} strokeWidth="6" fill="none" strokeLinecap="round" strokeDasharray={`${c} ${c}`} strokeDashoffset={dashOffset} transform={`rotate(-90 ${size/2} ${size/2})`}/>
+        </Svg>
+        <View style={{height:10}}/>
+        <Text style={SS.capturePct}>{Math.round(progress01*100)}%</Text>
+        <Text style={SS.captureSub}>Hold to complete</Text>
+      </View>
+    </View>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ELEVATOR DOORS OVERLAY
+// ─────────────────────────────────────────────────────────────────────────────
+function ElevatorDoorsOverlay({visible,progress,label}){
+  if(!visible)return null;
+  const leftX=progress.interpolate({inputRange:[0,1],outputRange:[-220,0]});
+  const rightX=progress.interpolate({inputRange:[0,1],outputRange:[220,0]});
+  const fade=progress.interpolate({inputRange:[0,1],outputRange:[0,0.92]});
+  return(
+    <View style={SS.doorsWrap} pointerEvents="none">
+      <Animated.View style={[SS.doorPanel,SS.doorLeft,{transform:[{translateX:leftX}]}]}/>
+      <Animated.View style={[SS.doorPanel,SS.doorRight,{transform:[{translateX:rightX}]}]}/>
+      <Animated.View style={[SS.doorShade,{opacity:fade}]}/>
+      <View style={SS.doorLabelWrap}><Text style={SS.doorLabel}>{label}</Text></View>
+    </View>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  HEARTS HUD
+// ─────────────────────────────────────────────────────────────────────────────
+function HeartRow({hearts}){
+  return(
+    <View style={{flexDirection:'row',gap:5}}>
+      {Array.from({length:MAX_HEARTS}).map((_,i)=>(
+        <View key={i} style={{width:13,height:13,borderRadius:3,
+          backgroundColor:i<hearts?'#ff3355':'#2a1a1a',
+          borderWidth:1,borderColor:i<hearts?'#ff6677':'#3a1a1a'}}/>
+      ))}
+    </View>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  CHIBI CHARACTER SVG
+// ─────────────────────────────────────────────────────────────────────────────
+function ChibiCharacter({charData,size=1,flip=false,opacity=1}){
+  if(!charData)return null;
+  const{gender,skin,hairColor,outfit,eyeColor,hairStyle,accessory='none'}=charData;
+  const isGirl=gender==='girl';
+  const hd=dk(hairColor,0.32),hl=lt(hairColor,0.42);
+  const od=dk(outfit,0.30),ol=lt(outfit,0.35);
+  const sd=dk(skin,0.22),sl=lt(skin,0.28);
+  const W=36*size,H=72*size;
+
+  if(isGirl){
+    const GirlHairBack=()=>{
+      if(hairStyle==='Long'||hairStyle==='Wavy')return(<G><Path d="M19,27 Q10,38 9,62 Q8,80 12,91 Q15,97 20,94 Q18,80 18,62 Q18,42 21,29 Z" fill={hairColor} stroke={hd} strokeWidth="0.8"/><Path d="M45,27 Q54,38 55,62 Q56,80 52,91 Q49,97 44,94 Q46,80 46,62 Q46,42 43,29 Z" fill={hairColor} stroke={hd} strokeWidth="0.8"/><Path d="M11,44 Q10,62 10.5,78" stroke={hl} strokeWidth="1.5" fill="none" opacity="0.4" strokeLinecap="round"/><Path d="M53,44 Q54,62 53.5,78" stroke={hl} strokeWidth="1.5" fill="none" opacity="0.4" strokeLinecap="round"/>{hairStyle==='Wavy'&&<><Path d="M9,50 Q6,56 9,62 Q6,68 9,74" stroke={hairColor} strokeWidth="4" fill="none" strokeLinecap="round" opacity="0.7"/><Path d="M55,50 Q58,56 55,62 Q58,68 55,74" stroke={hairColor} strokeWidth="4" fill="none" strokeLinecap="round" opacity="0.7"/></>}</G>);
+      if(hairStyle==='Ponytail')return(<G><Path d="M44,28 Q58,24 62,42 Q66,60 58,76 Q54,84 49,82 Q51,68 53,54 Q55,40 49,32 Z" fill={hairColor} stroke={hd} strokeWidth="0.8"/><Path d="M56,44 Q58,60 56,72" stroke={hl} strokeWidth="1.5" fill="none" opacity="0.4" strokeLinecap="round"/></G>);
+      if(hairStyle==='Pigtails')return(<G><Path d="M16,28 Q3,33 2,50 Q1,68 7,78 Q10,84 15,82 Q13,70 13,56 Q13,41 17,30 Z" fill={hairColor} stroke={hd} strokeWidth="0.8"/><Path d="M48,28 Q61,33 62,50 Q63,68 57,78 Q54,84 49,82 Q51,70 51,56 Q51,41 47,30 Z" fill={hairColor} stroke={hd} strokeWidth="0.8"/></G>);
+      if(hairStyle==='Bob')return(<G><Path d="M17,28 Q13,40 13,53 Q14,64 22,70 Q13,66 12,55 Q12,40 17,28 Z" fill={hairColor} stroke={hd} strokeWidth="0.8"/><Path d="M47,28 Q51,40 51,53 Q50,64 42,70 Q51,66 52,55 Q52,40 47,28 Z" fill={hairColor} stroke={hd} strokeWidth="0.8"/><Path d="M22,70 Q32,76 32,76 Q32,76 42,70" stroke={hairColor} strokeWidth="10" fill="none" strokeLinecap="round"/></G>);
+      return null;
+    };
+    const GirlHairFront=()=>{
+      const cap=(<G><Path d="M18,27 Q17,9 32,6 Q47,9 46,27 Q44,17 32,15 Q20,17 18,27 Z" fill={hairColor} stroke={hd} strokeWidth="0.8"/><Path d="M20,22 Q26,12 32,10 Q38,12 44,22" stroke={hl} strokeWidth="2" fill="none" opacity="0.45" strokeLinecap="round"/><Path d="M18,18 Q22,10 26,11" stroke={hl} strokeWidth="1.3" fill="none" opacity="0.3" strokeLinecap="round"/></G>);
+      if(hairStyle==='Bun')return<G>{cap}<Circle cx="32" cy="5" r="11" fill={hairColor} stroke={hd} strokeWidth="0.8"/><Path d="M22,5 Q32,-5 42,5 Q42,14 32,17 Q22,14 22,5 Z" fill={hd} opacity="0.2"/><Path d="M23,3 Q32,-1 41,3" stroke={hl} strokeWidth="2" fill="none" opacity="0.4" strokeLinecap="round"/><Circle cx="26" cy="1" r="4.5" fill={hl} opacity="0.3"/></G>;
+      if(hairStyle==='Bob')return<G>{cap}<Path d="M18,29 Q16,41 16,52 Q16,63 23,67 Q14,64 13,53 Q13,39 18,29 Z" fill={hairColor} stroke={hd} strokeWidth="0.8"/><Path d="M46,29 Q48,41 48,52 Q48,63 41,67 Q50,64 51,53 Q51,39 46,29 Z" fill={hairColor} stroke={hd} strokeWidth="0.8"/><Path d="M23,67 Q32,73 32,73 Q32,73 41,67" stroke={hairColor} strokeWidth="9" fill="none" strokeLinecap="round"/></G>;
+      if(hairStyle==='Ponytail')return<G>{cap}<Ellipse cx="45" cy="26" rx="6" ry="6" fill={outfit} stroke={hd} strokeWidth="1"/><Ellipse cx="45" cy="26" rx="3.5" ry="3.5" fill={ol}/><Circle cx="44" cy="25" r="1.5" fill="rgba(255,255,255,0.6)"/></G>;
+      if(hairStyle==='Pigtails')return<G>{cap}<Ellipse cx="17" cy="27" rx="6" ry="6" fill={outfit} stroke={hd} strokeWidth="1"/><Ellipse cx="17" cy="27" rx="3.5" ry="3.5" fill={ol}/><Ellipse cx="47" cy="27" rx="6" ry="6" fill={outfit} stroke={hd} strokeWidth="1"/><Ellipse cx="47" cy="27" rx="3.5" ry="3.5" fill={ol}/></G>;
+      return cap;
+    };
+    const Acc=()=>{
+      if(accessory==='bow')return<G><Path d="M18,7 C17,0 26,-1 28,7 C26,15 17,16 18,7 Z" fill={outfit} stroke={hd} strokeWidth="1"/><Path d="M46,7 C47,0 38,-1 36,7 C38,15 47,16 46,7 Z" fill={outfit} stroke={hd} strokeWidth="1"/><Circle cx="32" cy="7" r="5.5" fill={ol} stroke={hd} strokeWidth="1"/><Circle cx="32" cy="7" r="3" fill={outfit}/><Circle cx="31" cy="6" r="1.5" fill="rgba(255,255,255,0.7)"/></G>;
+      if(accessory==='tiara')return<G><Path d="M14,20 Q32,15 50,20 L50,26 Q32,22 14,26 Z" fill="#d4a820" stroke="#a07010" strokeWidth="0.8"/><Path d="M23,20 L19,9 L28,20 Z" fill="#e8c030" stroke="#a07010" strokeWidth="0.7"/><Path d="M29,20 L26,4 L32,0 L38,4 L35,20 Z" fill="#f0cc28" stroke="#a07010" strokeWidth="0.7"/><Path d="M41,20 L45,9 L36,20 Z" fill="#e8c030" stroke="#a07010" strokeWidth="0.7"/><Circle cx="32" cy="6" r="4.5" fill="#ff88cc" stroke="#a07010" strokeWidth="0.7"/><Circle cx="32" cy="6" r="2.5" fill="#ffbbdd"/><Circle cx="31" cy="5" r="1.2" fill="white" opacity="0.8"/><Circle cx="21" cy="14" r="3" fill="#88aaff" stroke="#a07010" strokeWidth="0.6"/><Circle cx="43" cy="14" r="3" fill="#88aaff" stroke="#a07010" strokeWidth="0.6"/></G>;
+      if(accessory==='band')return<Path d="M14,24 Q32,19 50,24 Q50,31 32,31 Q14,31 14,24 Z" fill={outfit} stroke={hd} strokeWidth="1" opacity="0.95"/>;
+      if(accessory==='flower')return<G>{[0,60,120,180,240,300].map((deg,i)=>{const r=deg*Math.PI/180;return<Ellipse key={i} cx={45+Math.cos(r)*7} cy={10+Math.sin(r)*7} rx="4.5" ry="2.5" fill="#ff88bb" stroke={hd} strokeWidth="0.6" transform={`rotate(${deg+90} ${45+Math.cos(r)*7} ${10+Math.sin(r)*7})`}/>;})}<Circle cx="45" cy="10" r="5.5" fill="#ffee44" stroke={hd} strokeWidth="0.8"/><Circle cx="45" cy="10" r="2.8" fill="#cc8800"/><Circle cx="44" cy="9" r="1.3" fill="rgba(255,255,255,0.7)"/></G>;
+      return null;
+    };
+    return(
+      <Svg width={W} height={H} viewBox="0 0 64 144" style={{opacity,transform:flip?[{scaleX:-1}]:[]}}>
+        <GirlHairBack/>
+        <Path d="M22,111 Q20,124 20,133 Q20,137 24,138 Q28,139 30,137 Q31,129 30,119 Q30,113 30,111 Z" fill={sd} stroke={dk(sd,0.15)} strokeWidth="0.8"/>
+        <Path d="M42,111 Q44,124 44,133 Q44,137 40,138 Q36,139 34,137 Q33,129 34,119 Q34,113 34,111 Z" fill={sd} stroke={dk(sd,0.15)} strokeWidth="0.8"/>
+        <Path d="M17,133 Q16,138 17,141 Q21,143 30,142 Q33,140 30,137 Z" fill="#1a0822" stroke={dk('#1a0822',0.3)} strokeWidth="0.8"/>
+        <Path d="M47,133 Q48,138 47,141 Q43,143 34,142 Q31,140 34,137 Z" fill="#1a0822" stroke={dk('#1a0822',0.3)} strokeWidth="0.8"/>
+        <Path d="M20,52 Q16,60 15,74 Q14,88 13,111 L51,111 Q50,88 49,74 Q48,60 44,52 Q38,57 32,58 Q26,57 20,52 Z" fill={outfit} stroke={od} strokeWidth="0.9"/>
+        <Path d="M20,52 Q16,62 15,78 L16,78 Q16,62 20,52 Z" fill={ol} opacity="0.28"/>
+        <Path d="M44,52 Q48,62 49,78 L48,78 Q48,62 44,52 Z" fill={od} opacity="0.22"/>
+        <Path d="M26,52 Q32,54 38,52 Q38,58 32,60 Q26,58 26,52 Z" fill={ol} opacity="0.55"/>
+        <Path d="M20,52 Q11,58 9,74 Q8,83 13,88 Q16,91 18,88 Q15,83 16,76 Q17,66 21,62 Z" fill={sd} stroke={dk(sd,0.2)} strokeWidth="0.8"/>
+        <Path d="M44,52 Q53,58 55,74 Q56,83 51,88 Q48,91 46,88 Q49,83 48,76 Q47,66 43,62 Z" fill={sd} stroke={dk(sd,0.2)} strokeWidth="0.8"/>
+        <Ellipse cx="13" cy="88" rx="5" ry="6" fill={sd} stroke={dk(sd,0.18)} strokeWidth="0.8"/>
+        <Ellipse cx="51" cy="88" rx="5" ry="6" fill={sd} stroke={dk(sd,0.18)} strokeWidth="0.8"/>
+        <Path d="M18,30 Q14,20 16,12 Q20,2 32,1 Q44,2 48,12 Q50,20 46,30 Q44,38 40,42 Q36,46 32,47 Q28,46 24,42 Q20,38 18,30 Z" fill={skin} stroke={sd} strokeWidth="0.9"/>
+        <Circle cx="22" cy="26" r="3.5" fill={lt(skin,0.12)} opacity="0.55"/>
+        <Circle cx="42" cy="26" r="3.5" fill={lt(skin,0.12)} opacity="0.55"/>
+        <Ellipse cx="24" cy="22" rx="5" ry="6" fill="white" stroke={sd} strokeWidth="0.7"/>
+        <Ellipse cx="40" cy="22" rx="5" ry="6" fill="white" stroke={sd} strokeWidth="0.7"/>
+        <Circle cx="25" cy="23" r="3.5" fill={eyeColor}/>
+        <Circle cx="41" cy="23" r="3.5" fill={eyeColor}/>
+        <Circle cx="26" cy="21" r="1.5" fill="rgba(255,255,255,0.8)"/>
+        <Circle cx="42" cy="21" r="1.5" fill="rgba(255,255,255,0.8)"/>
+        <Path d="M26,33 Q32,37 38,33" stroke={dk(skin,0.3)} strokeWidth="1.3" fill="none" strokeLinecap="round"/>
+        <GirlHairFront/>
+        <Acc/>
+      </Svg>
+    );
+  }
+
+  // BOY
+  const BoyHair=()=>{
+    if(hairStyle==='Short')return<Path d="M18,27 Q17,9 32,6 Q47,9 46,27 Q44,17 32,15 Q20,17 18,27 Z" fill={hairColor} stroke={hd} strokeWidth="0.8"/>;
+    if(hairStyle==='Spiky')return<G><Path d="M18,27 Q17,9 32,6 Q47,9 46,27 Q44,17 32,15 Q20,17 18,27 Z" fill={hairColor} stroke={hd} strokeWidth="0.8"/><Path d="M22,15 L18,3 L26,12 Z" fill={hairColor} stroke={hd} strokeWidth="0.7"/><Path d="M32,12 L30,0 L34,0 L32,12 Z" fill={hairColor} stroke={hd} strokeWidth="0.7"/><Path d="M42,15 L46,3 L38,12 Z" fill={hairColor} stroke={hd} strokeWidth="0.7"/></G>;
+    if(hairStyle==='Buzz')return<Path d="M18,27 Q17,9 32,6 Q47,9 46,27 Q44,18 32,16 Q20,18 18,27 Z" fill={hairColor} stroke={hd} strokeWidth="0.8" opacity="0.85"/>;
+    if(hairStyle==='Side')return<G><Path d="M18,27 Q17,9 32,6 Q47,9 46,27 Q44,17 32,15 Q20,17 18,27 Z" fill={hairColor} stroke={hd} strokeWidth="0.8"/><Path d="M18,20 Q24,8 38,10 Q44,11 46,18" stroke={hl} strokeWidth="3" fill="none" opacity="0.35" strokeLinecap="round"/></G>;
+    if(hairStyle==='Curly')return<G><Path d="M18,27 Q17,9 32,6 Q47,9 46,27 Q44,17 32,15 Q20,17 18,27 Z" fill={hairColor} stroke={hd} strokeWidth="0.8"/>{[20,26,32,38,44].map((x,i)=><Circle key={i} cx={x} cy="14" r="5" fill={hairColor} stroke={hd} strokeWidth="0.7"/>)}</G>;
+    if(hairStyle==='Mohawk')return<G><Path d="M18,27 Q17,14 32,12 Q47,14 46,27 Q44,20 32,18 Q20,20 18,27 Z" fill={hd} stroke={dk(hd,0.2)} strokeWidth="0.8"/><Path d="M26,14 Q32,0 38,14 Q35,10 32,10 Q29,10 26,14 Z" fill={hairColor} stroke={hd} strokeWidth="0.8"/></G>;
+    return null;
+  };
+  return(
+    <Svg width={W} height={H} viewBox="0 0 64 130" style={{opacity,transform:flip?[{scaleX:-1}]:[]}}>
+      <Path d="M24,100 Q22,114 22,123 Q22,127 26,128 Q30,129 31,127 Q32,119 31,109 Q31,103 31,100 Z" fill={sd} stroke={dk(sd,0.15)} strokeWidth="0.8"/>
+      <Path d="M40,100 Q42,114 42,123 Q42,127 38,128 Q34,129 33,127 Q32,119 33,109 Q33,103 33,100 Z" fill={sd} stroke={dk(sd,0.15)} strokeWidth="0.8"/>
+      <Path d="M19,123 Q18,127 19,130 Q23,132 31,131 Q34,129 31,127 Z" fill="#1a1008" stroke={dk('#1a1008',0.3)} strokeWidth="0.8"/>
+      <Path d="M45,123 Q46,127 45,130 Q41,132 33,131 Q30,129 33,127 Z" fill="#1a1008" stroke={dk('#1a1008',0.3)} strokeWidth="0.8"/>
+      <Path d="M20,48 Q16,56 16,72 Q15,86 14,100 L50,100 Q49,86 48,72 Q48,56 44,48 Q38,52 32,53 Q26,52 20,48 Z" fill={outfit} stroke={od} strokeWidth="0.9"/>
+      <Path d="M20,48 Q16,58 16,74 L17,74 Q17,58 20,48 Z" fill={ol} opacity="0.28"/>
+      <Path d="M44,48 Q48,58 48,74 L47,74 Q47,58 44,48 Z" fill={od} opacity="0.22"/>
+      <Path d="M20,48 Q11,54 9,68 Q8,78 13,82 Q16,85 18,82 Q15,77 16,70 Q17,62 21,58 Z" fill={sd} stroke={dk(sd,0.2)} strokeWidth="0.8"/>
+      <Path d="M44,48 Q53,54 55,68 Q56,78 51,82 Q48,85 46,82 Q49,77 48,70 Q47,62 43,58 Z" fill={sd} stroke={dk(sd,0.2)} strokeWidth="0.8"/>
+      <Ellipse cx="13" cy="82" rx="5" ry="5.5" fill={sd} stroke={dk(sd,0.18)} strokeWidth="0.8"/>
+      <Ellipse cx="51" cy="82" rx="5" ry="5.5" fill={sd} stroke={dk(sd,0.18)} strokeWidth="0.8"/>
+      <Path d="M18,28 Q14,18 16,10 Q20,1 32,0 Q44,1 48,10 Q50,18 46,28 Q44,36 40,40 Q36,44 32,45 Q28,44 24,40 Q20,36 18,28 Z" fill={skin} stroke={sd} strokeWidth="0.9"/>
+      <Circle cx="22" cy="24" r="3" fill={lt(skin,0.12)} opacity="0.55"/>
+      <Circle cx="42" cy="24" r="3" fill={lt(skin,0.12)} opacity="0.55"/>
+      <Ellipse cx="23" cy="20" rx="5" ry="5.5" fill="white" stroke={sd} strokeWidth="0.7"/>
+      <Ellipse cx="41" cy="20" rx="5" ry="5.5" fill="white" stroke={sd} strokeWidth="0.7"/>
+      <Circle cx="24" cy="21" r="3.5" fill={eyeColor}/>
+      <Circle cx="42" cy="21" r="3.5" fill={eyeColor}/>
+      <Circle cx="25" cy="19" r="1.5" fill="rgba(255,255,255,0.8)"/>
+      <Circle cx="43" cy="19" r="1.5" fill="rgba(255,255,255,0.8)"/>
+      <Path d="M26,32 Q32,36 38,32" stroke={dk(skin,0.3)} strokeWidth="1.3" fill="none" strokeLinecap="round"/>
+      <BoyHair/>
+    </Svg>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  CHARACTER CREATOR
+// ─────────────────────────────────────────────────────────────────────────────
+function CharacterCreator({onDone}){
+  const[gender,setGender]=useState(null);
+  const[skinI,setSkinI]=useState(0);
+  const[hairCI,setHairCI]=useState(0);
+  const[outfitI,setOutfitI]=useState(0);
+  const[eyeI,setEyeI]=useState(4);
+  const[styleI,setStyleI]=useState(0);
+  const[accI,setAccI]=useState(0);
+  const fade=useRef(new Animated.Value(0)).current;
+  const bob=useRef(new Animated.Value(0)).current;
+  useEffect(()=>{
+    Animated.timing(fade,{toValue:1,duration:600,useNativeDriver:true}).start();
+    const loop=()=>Animated.sequence([Animated.timing(bob,{toValue:-14,duration:600,useNativeDriver:true}),Animated.timing(bob,{toValue:0,duration:550,useNativeDriver:true}),Animated.delay(400)]).start(loop);loop();
+  },[]);
+  const charData=gender?{gender,skin:SKINS[skinI].c,hairColor:HAIRS[hairCI].c,outfit:OUTFITS[outfitI].c,eyeColor:EYES[eyeI].c,hairStyle:(gender==='boy'?BOY_STYLES:GIRL_STYLES)[styleI],accessory:gender==='girl'?GIRL_ACC[accI].v:'none'}:null;
+  const accent=gender==='girl'?'#ff88cc':gender==='boy'?'#60a8ff':'#c9a44c';
+  const PB={gender:'boy',skin:SKINS[1].c,hairColor:HAIRS[1].c,outfit:OUTFITS[0].c,eyeColor:EYES[4].c,hairStyle:'Short',accessory:'none'};
+  const PG={gender:'girl',skin:SKINS[0].c,hairColor:HAIRS[9].c,outfit:OUTFITS[6].c,eyeColor:EYES[4].c,hairStyle:'Long',accessory:'bow'};
+  if(!gender)return(
+    <Animated.View style={{flex:1,backgroundColor:'#03020c',opacity:fade,flexDirection:'row'}}>
+      <StatusBar hidden/>
+      <View style={{flex:0.38,justifyContent:'center',alignItems:'center',padding:28,borderRightWidth:1,borderRightColor:'#181428'}}>
+        <Text style={{fontSize:9,color:'#444',fontFamily:'monospace',letterSpacing:5,marginBottom:10}}>THE LAST FLOOR</Text>
+        <Text style={{fontSize:22,fontWeight:'900',color:'#e8dcc8',fontFamily:'monospace',letterSpacing:5,textAlign:'center',lineHeight:32,marginBottom:14}}>WHO{'\n'}ARE YOU?</Text>
+        <View style={{width:40,height:1,backgroundColor:'#333',marginBottom:14}}/>
+        <Text style={{fontSize:10,color:'#555',fontFamily:'monospace',textAlign:'center',lineHeight:17}}>Choose your survivor{'\n'}before the horror begins</Text>
+      </View>
+      <View style={{flex:0.62,flexDirection:'row',justifyContent:'space-evenly',alignItems:'center',padding:20,gap:14}}>
+        {[{g:'boy',ac:'#60a8ff',bc:'#2a3a5a',bgc:'#0a0e1a',lbl:'BOY',sub:'6 hairstyles',ch:PB},{g:'girl',ac:'#ff88cc',bc:'#5a2a3a',bgc:'#180a10',lbl:'GIRL',sub:'styles + accessories',ch:PG}].map(({g,ac,bc,bgc,lbl,sub,ch})=>(
+          <TouchableOpacity key={g} onPress={()=>setGender(g)} activeOpacity={0.8} style={{flex:1,alignItems:'center',gap:12,paddingVertical:20,paddingHorizontal:12,borderWidth:2,borderColor:bc,borderRadius:18,backgroundColor:bgc}}>
+            <ChibiCharacter charData={ch} size={2.8}/>
+            <Text style={{fontSize:18,fontWeight:'900',color:ac,fontFamily:'monospace',letterSpacing:5}}>{lbl}</Text>
+            <Text style={{fontSize:9,color:'#556',fontFamily:'monospace',letterSpacing:1,textAlign:'center'}}>{sub}</Text>
+            <View style={{borderWidth:1,borderColor:bc,paddingHorizontal:16,paddingVertical:7,borderRadius:4}}>
+              <Text style={{color:ac,fontFamily:'monospace',fontSize:11,letterSpacing:3}}>SELECT →</Text>
+            </View>
+          </TouchableOpacity>
+        ))}
+      </View>
+    </Animated.View>
+  );
+  const Swatch=({data,sel,onSel})=>(
+    <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+      <View style={{flexDirection:'row',gap:8,paddingVertical:2,paddingRight:8}}>
+        {data.map((item,i)=>(
+          <TouchableOpacity key={i} onPress={()=>onSel(i)} activeOpacity={0.8}
+            style={{width:30,height:30,borderRadius:15,borderWidth:3,backgroundColor:item.c,borderColor:sel===i?accent:'rgba(255,255,255,0.06)',transform:[{scale:sel===i?1.18:1}],alignItems:'center',justifyContent:'center'}}>
+            {sel===i&&<View style={{width:7,height:7,borderRadius:4,backgroundColor:'rgba(255,255,255,0.7)'}}/>}
+          </TouchableOpacity>
+        ))}
+      </View>
+    </ScrollView>
+  );
+  const isGirl=gender==='girl';
+  return(
+    <Animated.View style={{flex:1,backgroundColor:'#03020c',opacity:fade,flexDirection:'row'}}>
+      <StatusBar hidden/>
+      <View style={{width:220,alignItems:'center',justifyContent:'center',borderRightWidth:1,borderRightColor:'#181428',backgroundColor:'#050210',gap:8}}>
+        <Text style={{color:accent,fontFamily:'monospace',fontSize:8,letterSpacing:4,opacity:0.8}}>{isGirl?'GIRL':'BOY'}</Text>
+        <Animated.View style={{transform:[{translateY:bob}],alignItems:'center'}}>
+          {charData&&<ChibiCharacter charData={charData} size={3.0}/>}
+        </Animated.View>
+        <View style={{width:60,height:7,backgroundColor:'#000',borderRadius:30,opacity:0.35}}/>
+        <TouchableOpacity onPress={()=>setGender(null)} style={{paddingHorizontal:14,paddingVertical:7,borderWidth:1,borderColor:'#2a2040',borderRadius:4,marginTop:4}}>
+          <Text style={{color:'#555',fontFamily:'monospace',fontSize:9,letterSpacing:2}}>← BACK</Text>
+        </TouchableOpacity>
+      </View>
+      <ScrollView style={{flex:1}} contentContainerStyle={{padding:16}} showsVerticalScrollIndicator={false}>
+        <View style={{flexDirection:'row',gap:20}}>
+          <View style={{flex:1}}>
+            {[['SKIN',SKINS,skinI,setSkinI],['HAIR COLOR',HAIRS,hairCI,setHairCI],['OUTFIT',OUTFITS,outfitI,setOutfitI],['EYES',EYES,eyeI,setEyeI]].map(([lbl,data,sel,fn])=>(
+              <View key={lbl} style={{marginBottom:10}}>
+                <Text style={{color:accent,fontFamily:'monospace',fontSize:7.5,letterSpacing:3,marginBottom:6,opacity:0.7}}>{lbl}</Text>
+                <Swatch data={data} sel={sel} onSel={fn}/>
+              </View>
+            ))}
+          </View>
+          <View style={{flex:1}}>
+            <Text style={{color:accent,fontFamily:'monospace',fontSize:7.5,letterSpacing:3,marginBottom:6,opacity:0.7}}>HAIR STYLE</Text>
+            <View style={{flexDirection:'row',flexWrap:'wrap',gap:6,marginBottom:12}}>
+              {(isGirl?GIRL_STYLES:BOY_STYLES).map((s,i)=>(
+                <TouchableOpacity key={i} onPress={()=>setStyleI(i)} activeOpacity={0.8}
+                  style={{paddingHorizontal:10,paddingVertical:6,borderWidth:1.5,borderRadius:7,borderColor:styleI===i?accent:'#2a2040',backgroundColor:styleI===i?accent+'26':'#0a0818'}}>
+                  <Text style={{color:styleI===i?accent:'#668',fontFamily:'monospace',fontSize:9,letterSpacing:1}}>{s}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+            {isGirl&&<>
+              <Text style={{color:accent,fontFamily:'monospace',fontSize:7.5,letterSpacing:3,marginBottom:6,opacity:0.7}}>ACCESSORY</Text>
+              <View style={{flexDirection:'row',flexWrap:'wrap',gap:6,marginBottom:12}}>
+                {GIRL_ACC.map((a,i)=>(
+                  <TouchableOpacity key={i} onPress={()=>setAccI(i)} activeOpacity={0.8}
+                    style={{paddingHorizontal:10,paddingVertical:6,borderWidth:1.5,borderRadius:7,borderColor:accI===i?accent:'#2a2040',backgroundColor:accI===i?accent+'26':'#0a0818'}}>
+                    <Text style={{color:accI===i?accent:'#668',fontFamily:'monospace',fontSize:9,letterSpacing:1}}>{a.l}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </>}
+          </View>
+        </View>
+        <TouchableOpacity onPress={()=>charData&&onDone(charData)} activeOpacity={0.8}
+          style={{borderWidth:1.5,borderColor:accent,paddingVertical:14,alignItems:'center',borderRadius:10,backgroundColor:accent+'1a',marginTop:6}}>
+          <Text style={{color:accent,fontFamily:'monospace',letterSpacing:6,fontSize:14,fontWeight:'900'}}>ENTER THE HOUSE →</Text>
+        </TouchableOpacity>
+      </ScrollView>
+    </Animated.View>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  TITLE SCREEN
+// ─────────────────────────────────────────────────────────────────────────────
+function TitleScreen({onStart}){
+  const fade=useRef(new Animated.Value(0)).current;
+  const gy=useRef(new Animated.Value(0)).current;
+  useEffect(()=>{
+    Animated.timing(fade,{toValue:1,duration:1200,useNativeDriver:true}).start();
+    const loop=()=>Animated.sequence([Animated.timing(gy,{toValue:-14,duration:900,useNativeDriver:true}),Animated.timing(gy,{toValue:0,duration:800,useNativeDriver:true}),Animated.delay(300)]).start(loop);loop();
+  },[]);
+  return(
+    <Animated.View style={{flex:1,backgroundColor:'#03020a',opacity:fade}}>
+      <StatusBar hidden/>
+      <SafeAreaView style={{flex:1,justifyContent:'center',alignItems:'center',gap:18,padding:32}}>
+        <Animated.Text style={{fontSize:54,transform:[{translateY:gy}]}}>👻</Animated.Text>
+        <Text style={{fontSize:24,fontWeight:'900',color:'#e8dcc8',fontFamily:'monospace',letterSpacing:5,textAlign:'center'}}>THE LAST{'\n'}FLOOR</Text>
+        <Text style={{color:'#444',fontFamily:'monospace',fontSize:10,textAlign:'center',lineHeight:18,maxWidth:320}}>
+          4 floors. Each ghost guards its territory.{'\n'}Enter their zone — they will notice you.
+        </Text>
+        <View style={{gap:8,marginTop:10,width:'80%',maxWidth:360}}>
+          {[['THE MAZE','1 patrol zone','→ Sneak past to reach the key'],['THE UPPER FLOOR','2 overlapping zones','→ Time your crossing'],['THE ATTIC','2 fast zones + maze','→ Predict and avoid'],['NO ESCAPE','Everywhere is a zone','→ Run. Never stop.']].map(([n,d,tip],i)=>(
+            <View key={i} style={{flexDirection:'row',alignItems:'center',gap:10,backgroundColor:['#143314','#141434','#341422','#3a0008'][i],borderRadius:6,padding:9,borderWidth:1,borderColor:THEMES[i].edge+'44'}}>
+              <Text style={{color:'#c9a44c',fontFamily:'monospace',fontSize:9,letterSpacing:2,minWidth:20}}>F{i+1}</Text>
+              <View style={{flex:1}}><Text style={{color:'#bbb',fontFamily:'monospace',fontSize:9}}>{d}</Text><Text style={{color:'#666',fontFamily:'monospace',fontSize:8,marginTop:1}}>{tip}</Text></View>
+              <View style={{flexDirection:'row'}}>{Array(i+1).fill(0).map((_,j)=><Text key={j} style={{fontSize:11}}>👻</Text>)}</View>
+            </View>
+          ))}
+        </View>
+        <TouchableOpacity onPress={onStart} style={{marginTop:12,borderWidth:1,borderColor:'#c9a44c',paddingVertical:14,paddingHorizontal:44,borderRadius:4,backgroundColor:'#0a0818'}} activeOpacity={0.8}>
+          <Text style={{color:'#c9a44c',fontFamily:'monospace',letterSpacing:7,fontSize:16,fontWeight:'900'}}>PLAY</Text>
+        </TouchableOpacity>
+      </SafeAreaView>
+    </Animated.View>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  DEAD / WIN SCREENS
+// ─────────────────────────────────────────────────────────────────────────────
+function DeadScreen({charData,onRetry,onMenu}){
+  const fade=useRef(new Animated.Value(0)).current;
+  useEffect(()=>{Animated.timing(fade,{toValue:1,duration:600,useNativeDriver:true}).start();},[]);
+  return(
+    <Animated.View style={{flex:1,alignItems:'center',justifyContent:'center',backgroundColor:'#0c0008',opacity:fade,gap:16}}>
+      <StatusBar hidden/>
+      {charData&&<ChibiCharacter charData={charData} size={2.4} opacity={0.30}/>}
+      <Text style={{fontSize:36,fontWeight:'900',color:'#cc1122',fontFamily:'monospace',letterSpacing:8}}>CAUGHT</Text>
+      <Text style={{color:'#666',fontFamily:'monospace',fontSize:11,letterSpacing:2}}>You entered the ghost's territory.</Text>
+      <Text style={{color:'#444',fontFamily:'monospace',fontSize:11,textAlign:'center',lineHeight:20,maxWidth:280}}>
+        Watch for the dashed zone ring.{'\n'}Cross it and the ghost will notice you.
+      </Text>
+      <TouchableOpacity style={{borderWidth:1,borderColor:'#8b1a1a',paddingVertical:12,paddingHorizontal:28,borderRadius:4,marginTop:8}} onPress={onRetry} activeOpacity={0.8}>
+        <Text style={{color:'#cc3344',fontFamily:'monospace',letterSpacing:3,fontSize:13}}>RETRY</Text>
+      </TouchableOpacity>
+      <TouchableOpacity style={{borderWidth:1,borderColor:'#2a2040',paddingVertical:12,paddingHorizontal:28,borderRadius:4}} onPress={onMenu} activeOpacity={0.8}>
+        <Text style={{color:'#555',fontFamily:'monospace',letterSpacing:3,fontSize:13}}>MAIN MENU</Text>
+      </TouchableOpacity>
+    </Animated.View>
+  );
+}
+function WinScreen({charData,onPlay,onMenu}){
+  const fade=useRef(new Animated.Value(0)).current;
+  const sc=useRef(new Animated.Value(0.5)).current;
+  useEffect(()=>{Animated.parallel([Animated.timing(fade,{toValue:1,duration:900,useNativeDriver:true}),Animated.spring(sc,{toValue:1,friction:5,useNativeDriver:true})]).start();Vibration.vibrate([0,80,40,80,40,160]);},[]);
+  return(
+    <Animated.View style={{flex:1,alignItems:'center',justifyContent:'center',backgroundColor:'#020e06',opacity:fade,gap:14}}>
+      <StatusBar hidden/>
+      <Animated.View style={{transform:[{scale:sc}]}}>{charData&&<ChibiCharacter charData={charData} size={3.2}/>}</Animated.View>
+      <Text style={{fontSize:36,fontWeight:'900',color:'#5ecfa0',fontFamily:'monospace',letterSpacing:8}}>ESCAPED</Text>
+      <Text style={{color:'#666',fontFamily:'monospace',fontSize:11,letterSpacing:2}}>All 4 keys collected. You survived.</Text>
+      <TouchableOpacity style={{borderWidth:1,borderColor:'#5ecfa0',paddingVertical:12,paddingHorizontal:28,borderRadius:4,marginTop:10}} onPress={onPlay} activeOpacity={0.8}>
+        <Text style={{color:'#5ecfa0',fontFamily:'monospace',letterSpacing:3,fontSize:13}}>PLAY AGAIN</Text>
+      </TouchableOpacity>
+      <TouchableOpacity style={{borderWidth:1,borderColor:'#2a2040',paddingVertical:12,paddingHorizontal:28,borderRadius:4}} onPress={onMenu} activeOpacity={0.8}>
+        <Text style={{color:'#555',fontFamily:'monospace',letterSpacing:3,fontSize:13}}>MAIN MENU</Text>
+      </TouchableOpacity>
+    </Animated.View>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  MAIN APP
+// ─────────────────────────────────────────────────────────────────────────────
+export default function App(){
+  const canUseAV=!!Audio;
+  const{width,height}=Dimensions.get('window');
+  const isSmall=Math.min(width,height)<380;
+  const HUD_H=isSmall?88:96;
+  const HINT_H=50;
+  const CONTROLS_H=isSmall?210:220;
+  const SAFE_BOT=Platform.OS==='ios'?16:10;
+  const ZOOM=useMemo(()=>{const s=Math.min(width,height);if(s<=360)return 1.22;if(s<=390)return 1.30;if(s<=430)return 1.36;return 1.40;},[width,height]);
+
+  const[screen,setScreen]=useState('title');
+  const[charData,setCharData]=useState(null);
+  const[micEnabled,setMicEnabled]=useState(MIC_ENABLED_DEFAULT);
+  const[micDb,setMicDb]=useState(-160);
+  const micDbRef=useRef(-160);
+
+  const floorsRef=useRef(buildFloors());
+  const[floorIndex,setFloorIndex]=useState(0);
+  const floorIndexRef=useRef(0);
+  const[keysTaken,setKeysTaken]=useState([false,false,false,false]);
+  const keysTakenRef=useRef([false,false,false,false]);
+
+  const[hearts,setHearts]=useState(MAX_HEARTS);
+  const heartsRef=useRef(MAX_HEARTS);
+  const[player,setPlayer]=useState({x:120,y:790});
+  const playerRef=useRef({x:120,y:790});
+  const enemiesRef=useRef([]);
+  const moveRef=useRef({up:false,down:false,left:false,right:false});
+
+  const[panic,setPanic]=useState({active:false,endsAt:0,startsAt:0});
+  const panicRef=useRef({active:false,endsAt:0,startsAt:0});
+  const secondKeyTimeRef=useRef(null);
+  const lastHitRef=useRef(0);
+
+  const captureRef=useRef(null);
+  const[captureUI,setCaptureUI]=useState({visible:false,type:null,progress01:0});
+
+  const[elevatorBusy,setElevatorBusy]=useState(false);
+  const doorsProgress=useRef(new Animated.Value(0)).current;
+  const[doorsLabel,setDoorsLabel]=useState('ELEVATOR');
+  const[doorsVisible,setDoorsVisible]=useState(false);
+
+  const ambienceRef=useRef(null);
+  const panicSndRef=useRef(null);
+  const stepsRef=useRef(null);
+  const recRef=useRef(null);
+  const micPollRef=useRef(null);
+
+  // For rendering: track enemy states to trigger re-render
+  const[enemyStates,setEnemyStates]=useState([]);
+
+  const currentFloor=floorsRef.current[floorIndex];
+  const theme=THEMES[currentFloor.theme];
+
+  const viewH=useMemo(()=>{
+    const usable=height-HUD_H-HINT_H-CONTROLS_H-SAFE_BOT;
+    return Math.max(240,usable);
+  },[height,HUD_H,HINT_H,CONTROLS_H,SAFE_BOT]);
+
+  const camera=useMemo(()=>{
+    const cx=player.x,cy=player.y;
+    const sw=width/ZOOM,sh=viewH/ZOOM;
+    const left=clamp(cx-sw/2,0,WORLD_W-sw);
+    const top=clamp(cy-sh/2,0,WORLD_H-sh);
+    return{translateX:-left*ZOOM,translateY:-top*ZOOM};
+  },[player,width,viewH,ZOOM]);
+
+  // ── AUDIO ────────────────────────────────────────────────────────────────────
+  useEffect(()=>{
+    if(!canUseAV)return;
+    let mounted=true;
+    (async()=>{
+      try{await Audio.setAudioModeAsync({allowsRecordingIOS:true,playsInSilentModeIOS:true,staysActiveInBackground:false,shouldDuckAndroid:true});}catch{}
+      const amb=await safeLoadLoop(SOUND_URLS.ambience,0.45);
+      const pnc=await safeLoadLoop(SOUND_URLS.panic,0.0);
+      const stp=await safeLoadLoop(SOUND_URLS.steps,0.0);
+      if(!mounted){await safeUnload(amb);await safeUnload(pnc);await safeUnload(stp);return;}
+      ambienceRef.current=amb;panicSndRef.current=pnc;stepsRef.current=stp;
+      await safePlay(amb);await safePlay(pnc);await safePlay(stp);
+    })();
+    return()=>{mounted=false;(async()=>{await safeUnload(ambienceRef.current);await safeUnload(panicSndRef.current);await safeUnload(stepsRef.current);})();};
+  },[canUseAV]);
+
+  // ── MIC ──────────────────────────────────────────────────────────────────────
+  useEffect(()=>{
+    const shouldRun=canUseAV&&screen==='play'&&micEnabled;
+    const stopMic=async()=>{
+      if(micPollRef.current){clearInterval(micPollRef.current);micPollRef.current=null;}
+      try{if(recRef.current){const r=recRef.current;recRef.current=null;await r.stopAndUnloadAsync();}}catch{}
+      setMicDb(-160);
+    };
+    const startMic=async()=>{
+      try{
+        const perm=await Audio.requestPermissionsAsync();
+        if(!perm.granted){setMicEnabled(false);Alert.alert('Microphone','Permission not granted. Mic lure turned OFF.');return;}
+        const rec=new Audio.Recording();
+        await rec.prepareToRecordAsync({android:{extension:'.m4a',outputFormat:Audio.AndroidOutputFormat.MPEG_4,audioEncoder:Audio.AndroidAudioEncoder.AAC,sampleRate:44100,numberOfChannels:1,bitRate:64000},ios:{extension:'.caf',audioQuality:Audio.IOSAudioQuality.MIN,sampleRate:44100,numberOfChannels:1,bitRate:64000,linearPCMBitDepth:16,linearPCMIsBigEndian:false,linearPCMIsFloat:false},isMeteringEnabled:true});
+        await rec.startAsync();recRef.current=rec;
+        micPollRef.current=setInterval(async()=>{try{if(!recRef.current)return;const s=await recRef.current.getStatusAsync();if(typeof s.metering==='number'){micDbRef.current=s.metering;setMicDb(s.metering);}}catch{}},MIC_POLL_MS);
+      }catch{setMicEnabled(false);}
+    };
+    if(shouldRun)startMic();else stopMic();
+    return()=>stopMic();
+  },[screen,micEnabled,canUseAV]);
+
+  // ── PANIC ────────────────────────────────────────────────────────────────────
+  useEffect(()=>{
+    const count=keysTaken.filter(Boolean).length;
+    if(count===2&&secondKeyTimeRef.current===null)secondKeyTimeRef.current=Date.now();
+  },[keysTaken]);
+
+  useEffect(()=>{
+    if(screen!=='play')return;
+    const t=setInterval(()=>{
+      const sk=secondKeyTimeRef.current;if(!sk)return;
+      const now=Date.now(),p=panicRef.current;
+      if(!p.active&&now-sk>=PANIC_DELAY_MS){
+        const endsAt=now+PANIC_DURATION_MS;
+        const next={active:true,startsAt:now,endsAt};
+        panicRef.current=next;setPanic(next);
+        safeVol(panicSndRef.current,0.85);
+        const pl=playerRef.current;
+        const extra=[];
+        for(let i=0;i<PANIC_EXTRA_ENEMIES;i++){
+          const ang=(Math.PI*2*i)/PANIC_EXTRA_ENEMIES;
+          const rx=clamp(pl.x+Math.cos(ang)*230,ENEMY_R,WORLD_W-ENEMY_R);
+          const ry=clamp(pl.y+Math.sin(ang)*230,ENEMY_R,WORLD_H-ENEMY_R);
+          extra.push({x:rx,y:ry,patrol:[{x:rx,y:ry},{x:rx+10,y:ry+10}],patrolIndex:1,kind:'PANIC',
+            zone:{cx:rx,cy:ry,r:120},state:'chase',alertUntil:0});
+        }
+        enemiesRef.current=[...enemiesRef.current,...extra];
+      }
+      if(p.active&&now>=p.endsAt){
+        const next={active:false,startsAt:0,endsAt:0};
+        panicRef.current=next;setPanic(next);
+        safeVol(panicSndRef.current,0.0);
+        enemiesRef.current=enemiesRef.current.filter(e=>e.kind!=='PANIC');
+      }
+    },250);
+    return()=>clearInterval(t);
+  },[screen]);
+
+  // ── MAIN GAME LOOP ───────────────────────────────────────────────────────────
+  useEffect(()=>{
+    if(screen!=='play')return;
+    let raf=null,last=Date.now();
+    let lastRenderPlayer=0,lastRenderCapture=0,lastRenderEnemies=0;
+    const RENDER_PLAYER_MS=33,RENDER_CAPTURE_MS=60,RENDER_ENEMIES_MS=80;
+
+    const cancelCapture=()=>{captureRef.current=null;setCaptureUI({visible:false,type:null,progress01:0});};
+
+    const tick=()=>{
+      const now=Date.now(),rawDt=now-last;last=now;
+      const dt=Math.min(rawDt,40);
+      if(elevatorBusy){raf=requestAnimationFrame(tick);return;}
+
+      const fi=floorIndexRef.current;
+      const f=floorsRef.current[fi];
+      const walls=f.walls;
+      const mv=moveRef.current;
+      const p0=playerRef.current;
+
+      // ── PLAYER MOVEMENT ────────────────────────────────────────────────────
+      let vx=0,vy=0;
+      if(mv.left)vx-=PLAYER_SPD;
+      if(mv.right)vx+=PLAYER_SPD;
+      if(mv.up)vy-=PLAYER_SPD;
+      if(mv.down)vy+=PLAYER_SPD;
+      if(vx!==0&&vy!==0){vx*=0.7071;vy*=0.7071;}
+      const k=dt/16.67;
+      let nx=p0.x+vx*k,ny=p0.y+vy*k;
+      nx=clamp(nx,PLAYER_R,WORLD_W-PLAYER_R);
+      ny=clamp(ny,PLAYER_R,WORLD_H-PLAYER_R);
+      for(const w of walls){
+        if(circleRect(nx,ny,PLAYER_R,w.x,w.y,w.w,w.h)){
+          const tx=p0.x+vx*k;
+          if(!circleRect(tx,p0.y,PLAYER_R,w.x,w.y,w.w,w.h)){nx=tx;ny=p0.y;}
+          else{const ty=p0.y+vy*k;if(!circleRect(p0.x,ty,PLAYER_R,w.x,w.y,w.w,w.h)){nx=p0.x;ny=ty;}else{nx=p0.x;ny=p0.y;}}
+        }
+      }
+      playerRef.current={x:nx,y:ny};
+
+      // ── GHOST ZONE AI ──────────────────────────────────────────────────────
+      const loud=canUseAV&&micEnabled&&micDbRef.current>MIC_THRESHOLD_DB;
+      const pl=playerRef.current;
+
+      for(const e of enemiesRef.current){
+        // ── Mic lure overrides zone AI ──
+        if(loud&&dist(pl.x,pl.y,e.x,e.y)<=MIC_LURE_RADIUS){
+          e.state='chase';
+          e.alertUntil=now+GHOST_ALERT_LINGER;
+        } else if(e.kind!=='PANIC'){
+          const dToPlayer=dist(pl.x,pl.y,e.x,e.y);
+          const dToZoneCenter=dist(pl.x,pl.y,e.zone.cx,e.zone.cy);
+          const playerInZone=dToZoneCenter<e.zone.r+GHOST_ZONE_SENSE;
+
+          if(e.state==='patrol'){
+            if(playerInZone)e.state='alert';
+          } else if(e.state==='alert'){
+            if(dToPlayer<GHOST_CHASE_RANGE)e.state='chase';
+            else if(!playerInZone&&now>e.alertUntil)e.state='patrol';
+            else if(playerInZone)e.alertUntil=now+GHOST_ALERT_LINGER;
+          } else if(e.state==='chase'){
+            if(dToPlayer>GHOST_FORGET_DIST){
+              e.state='alert';
+              e.alertUntil=now+GHOST_ALERT_LINGER;
+            }
+          }
+        }
+
+        // ── Movement based on state ──
+        let tx,ty,spd;
+        if(e.state==='chase'){
+          tx=pl.x;ty=pl.y;
+          spd=GHOST_SPD_CHASE*(panicRef.current.active&&e.kind==='PANIC'?1.5:1)*(loud?MIC_ENEMY_SPD_BOOST:1);
+        } else if(e.state==='alert'){
+          // Move toward zone center to guard
+          tx=e.zone.cx;ty=e.zone.cy;spd=GHOST_SPD_ALERT;
+        } else {
+          // Patrol between patrol points
+          const tgt=e.patrol[e.patrolIndex];
+          if(dist(e.x,e.y,tgt.x,tgt.y)<10)e.patrolIndex=e.patrolIndex===0?1:0;
+          const t2=e.patrol[e.patrolIndex];tx=t2.x;ty=t2.y;spd=GHOST_SPD_PATROL;
+        }
+
+        const dx=tx-e.x,dy=ty-e.y,mag=Math.max(0.0001,Math.sqrt(dx*dx+dy*dy));
+        let ex=e.x+(dx/mag)*spd*k,ey=e.y+(dy/mag)*spd*k;
+        let blocked=false;
+        for(const w of walls){if(circleRect(ex,ey,ENEMY_R,w.x,w.y,w.w,w.h)){blocked=true;break;}}
+        if(!blocked){e.x=clamp(ex,ENEMY_R,WORLD_W-ENEMY_R);e.y=clamp(ey,ENEMY_R,WORLD_H-ENEMY_R);}
+      }
+
+      // ── FOOTSTEP VOLUME ────────────────────────────────────────────────────
+      if(canUseAV){
+        const nearest=enemiesRef.current.reduce((b,e)=>Math.min(b,dist(pl.x,pl.y,e.x,e.y)),Infinity);
+        safeVol(stepsRef.current,nearest<330?clamp(1-nearest/330,0,1)*0.85:0);
+      }
+
+      // ── HIT DETECTION ──────────────────────────────────────────────────────
+      if(now-lastHitRef.current>ENEMY_HIT_COOLDOWN_MS){
+        for(const e of enemiesRef.current){
+          if(dist(pl.x,pl.y,e.x,e.y)<PLAYER_R+ENEMY_R-2){
+            lastHitRef.current=now;
+            cancelCapture();
+            const nh=heartsRef.current-1;
+            heartsRef.current=nh;setHearts(nh);
+            Vibration.vibrate([0,150,60,280]);
+            if(nh<=0){cancelAnimationFrame(raf);setScreen('dead');return;}
+            break;
+          }
+        }
+      }
+
+      // ── CAPTURE ────────────────────────────────────────────────────────────
+      const cap=captureRef.current;
+      if(cap){
+        const elapsed=now-cap.startedAt;
+        const progress01=clamp(elapsed/cap.durationMs,0,1);
+        const kt=keysTakenRef.current;
+        const keyOk=!kt[fi]&&dist(pl.x,pl.y,f.key.x,f.key.y)<INTERACT_RADIUS;
+        const bandOk=!f.bandage.taken&&dist(pl.x,pl.y,f.bandage.x,f.bandage.y)<INTERACT_RADIUS;
+        const stillNear=cap.type==='KEY'?keyOk:bandOk;
+        if(!stillNear){cancelCapture();}
+        else{
+          if(now-lastRenderCapture>RENDER_CAPTURE_MS){lastRenderCapture=now;setCaptureUI({visible:true,type:cap.type,progress01});}
+          if(progress01>=1){
+            if(cap.type==='KEY'){
+              setKeysTaken(prev=>{const next=[...prev];next[fi]=true;keysTakenRef.current=next;return next;});
+            }else{
+              f.bandage.taken=true;
+              const nh=clamp(heartsRef.current+1,0,MAX_HEARTS);
+              heartsRef.current=nh;setHearts(nh);
+            }
+            cancelCapture();
+          }
+        }
+      }
+
+      // ── THROTTLED RENDERS ──────────────────────────────────────────────────
+      if(now-lastRenderPlayer>RENDER_PLAYER_MS){lastRenderPlayer=now;setPlayer({...playerRef.current});}
+      if(now-lastRenderEnemies>RENDER_ENEMIES_MS){
+        lastRenderEnemies=now;
+        setEnemyStates(enemiesRef.current.map(e=>({x:e.x,y:e.y,state:e.state,kind:e.kind,zone:e.zone})));
+      }
+      raf=requestAnimationFrame(tick);
+    };
+    raf=requestAnimationFrame(tick);
+    return()=>{if(raf)cancelAnimationFrame(raf);};
+  },[screen,canUseAV,micEnabled,elevatorBusy]);
+
+  // ── RESET ────────────────────────────────────────────────────────────────────
+  const resetAll=useCallback(()=>{
+    floorsRef.current=buildFloors();
+    enemiesRef.current=[];
+    secondKeyTimeRef.current=null;
+    setKeysTaken([false,false,false,false]);keysTakenRef.current=[false,false,false,false];
+    setHearts(MAX_HEARTS);heartsRef.current=MAX_HEARTS;
+    setPanic({active:false,startsAt:0,endsAt:0});panicRef.current={active:false,startsAt:0,endsAt:0};
+    setFloorIndex(0);floorIndexRef.current=0;
+    const f0=floorsRef.current[0];
+    setPlayer({x:f0.spawn.x,y:f0.spawn.y});playerRef.current={x:f0.spawn.x,y:f0.spawn.y};
+    moveRef.current={up:false,down:false,left:false,right:false};
+    captureRef.current=null;setCaptureUI({visible:false,type:null,progress01:0});
+    setElevatorBusy(false);doorsProgress.setValue(0);setDoorsVisible(false);setDoorsLabel('ELEVATOR');
+    lastHitRef.current=0;setEnemyStates([]);
+  },[]);
+
+  const startGame=useCallback(()=>{resetAll();setScreen('play');},[resetAll]);
+
+  // ── ELEVATOR ─────────────────────────────────────────────────────────────────
+  const allKeys=keysTaken.filter(Boolean).length===4;
+  const animDoors=(toValue,duration)=>new Promise(res=>{Animated.timing(doorsProgress,{toValue,duration,easing:Easing.inOut(Easing.cubic),useNativeDriver:true}).start(()=>res());});
+
+  const elevatorSequence=useCallback(async()=>{
+    if(elevatorBusy)return;
+    if(panicRef.current.active)return;
+    if(captureRef.current){captureRef.current=null;setCaptureUI({visible:false,type:null,progress01:0});}
+    setElevatorBusy(true);setDoorsVisible(true);
+    try{
+      setDoorsLabel('DOORS CLOSING');await animDoors(1,520);
+      if(allKeys){setDoorsLabel('ESCAPING');await new Promise(r=>setTimeout(r,450));setScreen('win');return;}
+      setDoorsLabel('MOVING…');await new Promise(r=>setTimeout(r,500));
+      const cur=floorIndexRef.current;
+      const opts=[0,1,2,3].filter(i=>i!==cur);
+      const next=opts[Math.floor(Math.random()*opts.length)];
+      const nextFloor=floorsRef.current[next];
+      enemiesRef.current=nextFloor.enemies.map(e=>({...e,patrolIndex:0}));
+      playerRef.current={x:nextFloor.spawn.x,y:nextFloor.spawn.y};
+      setPlayer({x:nextFloor.spawn.x,y:nextFloor.spawn.y});
+      floorIndexRef.current=next;setFloorIndex(next);
+      await new Promise(r=>setTimeout(r,80));
+      setDoorsLabel('DOORS OPENING');await animDoors(0,520);
+      setDoorsVisible(false);setDoorsLabel('ELEVATOR');
+    }finally{setElevatorBusy(false);}
+  },[elevatorBusy,allKeys]);
+
+  // ── INIT ENEMIES on floor load ────────────────────────────────────────────────
+  useEffect(()=>{
+    if(screen==='play'){
+      const f=floorsRef.current[floorIndex];
+      enemiesRef.current=f.enemies.map(e=>({...e,patrolIndex:0}));
+      setEnemyStates(f.enemies.map(e=>({x:e.x,y:e.y,state:e.state,kind:e.kind,zone:e.zone})));
+    }
+  },[screen,floorIndex]);
+
+  // ── DERIVED UI ────────────────────────────────────────────────────────────────
+  const pl=player,fi=floorIndex,cf=currentFloor;
+  const keyAvailable=!keysTaken[fi];
+  const bandAvailable=!cf.bandage.taken;
+  const nearKey=keyAvailable&&dist(pl.x,pl.y,cf.key.x,cf.key.y)<INTERACT_RADIUS;
+  const nearBand=bandAvailable&&dist(pl.x,pl.y,cf.bandage.x,cf.bandage.y)<INTERACT_RADIUS;
+  const inElevator=aabbOverlap(pl.x-PLAYER_R,pl.y-PLAYER_R,PLAYER_R*2,PLAYER_R*2,cf.elevator.x,cf.elevator.y,cf.elevator.w,cf.elevator.h);
+  const canCapture=!elevatorBusy&&(nearKey||nearBand);
+  const captureLabel=nearKey?'CAPTURE KEY':nearBand?'BANDAGE':'CAPTURE';
+
+  const onCaptureDown=()=>{
+    if(!canCapture||captureRef.current)return;
+    if(nearKey)captureRef.current={type:'KEY',startedAt:Date.now(),durationMs:KEY_HOLD_MS};
+    else captureRef.current={type:'BANDAGE',startedAt:Date.now(),durationMs:BANDAGE_HOLD_MS};
+    setCaptureUI({visible:true,type:captureRef.current.type,progress01:0});
+  };
+  const onCaptureUp=()=>{if(!captureRef.current)return;captureRef.current=null;setCaptureUI({visible:false,type:null,progress01:0});};
+
+  const visibleEnemies=enemyStates.filter(e=>dist(pl.x,pl.y,e.x,e.y)<=ENEMY_SHOW_RADIUS);
+  const anyChasing=enemyStates.some(e=>e.state==='chase');
+  const anyAlert=enemyStates.some(e=>e.state==='alert');
+  const panicSec=panic.active?Math.ceil(Math.max(0,panic.endsAt-Date.now())/1000):0;
+
+  const hintText=(()=>{
+    if(elevatorBusy)return 'Elevator in use…';
+    if(captureUI.visible)return 'Keep holding…';
+    if(anyChasing)return '⚠ GHOST CHASING — RUN!';
+    if(anyAlert)return '? Ghost noticed something. Be careful.';
+    if(nearKey)return 'Hold CAPTURE to take the key (5s)';
+    if(nearBand)return 'Hold BANDAGE to heal (2.5s)';
+    if(inElevator)return allKeys?'Press ESCAPE to get out!':'Press ELEVATOR to travel (random floor)';
+    return 'Stay outside the zone rings. Ghosts guard their territory.';
+  })();
+
+  // ── SCREENS ───────────────────────────────────────────────────────────────────
+  if(screen==='title')return<TitleScreen onStart={()=>setScreen('customize')}/>;
+  if(screen==='customize')return<CharacterCreator onDone={cd=>{setCharData(cd);startGame();}}/>;
+  if(screen==='dead')return<DeadScreen charData={charData} onRetry={startGame} onMenu={()=>setScreen('title')}/>;
+  if(screen==='win')return<WinScreen charData={charData} onPlay={startGame} onMenu={()=>setScreen('title')}/>;
+
+  // ── PLAY ─────────────────────────────────────────────────────────────────────
+  return(
+    <SafeAreaView style={[SS.full,{backgroundColor:theme.bg}]}>
+      <StatusBar hidden/>
+
+      {/* HUD */}
+      <View style={[SS.hud,{height:HUD_H,backgroundColor:theme.bg2,borderBottomWidth:1,borderBottomColor:theme.edge+'44'}]}>
+        <View style={{gap:5}}>
+          <Text style={SS.hudTitle}>THE LAST FLOOR</Text>
+          <Text style={SS.hudSub}>UNKNOWN FLOOR</Text>
+          <Text style={[SS.hudTiny,{color:anyChasing?theme.chaseColor:anyAlert?theme.alertColor:'rgba(255,255,255,0.45)'}]}>
+            {anyChasing?'⚠ CHASE MODE':anyAlert?'? ALERT MODE':'Keys: '+keysTaken.filter(Boolean).length+'/4'}
+            {canUseAV&&micEnabled?`  |  MIC ${Math.round(micDb)} dB`:''}
+          </Text>
+        </View>
+        <View style={{alignItems:'flex-end',gap:8}}>
+          <HeartRow hearts={hearts}/>
+          {panic.active
+            ?<Text style={SS.panicText}>⚠ LOCKDOWN {panicSec}s</Text>
+            :<Text style={SS.hudTiny}>Enter zones → ghost notices you</Text>}
+          {charData&&<ChibiCharacter charData={charData} size={0.65} flip/>}
+        </View>
+      </View>
+
+      {/* VIEWPORT */}
+      <View style={[SS.viewport,{height:viewH,borderTopColor:theme.edge+'33',borderBottomColor:theme.edge+'33'}]}>
+        <View style={{width:WORLD_W*ZOOM,height:WORLD_H*ZOOM,transform:[{translateX:camera.translateX},{translateY:camera.translateY}]}}>
+          <View style={{position:'absolute',left:0,top:0,width:WORLD_W*ZOOM,height:WORLD_H*ZOOM}}>
+
+            {/* ── ADVANCED BACKGROUND ─────────────────────────────────────── */}
+            <FloorBackground theme={theme} zoom={ZOOM}/>
+
+            {/* ── GHOST ZONE RINGS (rendered under everything else) ─────────── */}
+            {enemyStates.map((e,i)=>(
+              <GhostZoneRing key={`zr${i}`} zone={e.zone} state={e.state} theme={theme} zoom={ZOOM}/>
+            ))}
+
+            {/* ── WALLS ────────────────────────────────────────────────────── */}
+            {cf.walls.map((w,i)=>(
+              <WallBlock key={`w${i}`} w={w} theme={theme} zoom={ZOOM}/>
+            ))}
+
+            {/* ── ELEVATOR ─────────────────────────────────────────────────── */}
+            <View style={{
+              position:'absolute',
+              left:cf.elevator.x*ZOOM,top:cf.elevator.y*ZOOM,
+              width:cf.elevator.w*ZOOM,height:cf.elevator.h*ZOOM,
+              backgroundColor:inElevator?'rgba(94,207,160,0.14)':'rgba(255,255,255,0.04)',
+              borderWidth:2,borderColor:inElevator?theme.accent:theme.edge+'88',
+              borderRadius:10,justifyContent:'center',alignItems:'center',
+            }}>
+              {/* Inner panel detail */}
+              <View style={{position:'absolute',left:6,top:6,right:6,bottom:6,borderWidth:1,borderColor:theme.edge+'44',borderRadius:6}}/>
+              <Text style={{color:inElevator?theme.accent:'rgba(255,255,255,0.6)',fontWeight:'900',fontSize:9*ZOOM,textAlign:'center',fontFamily:'monospace',letterSpacing:1}}>
+                {allKeys?'ESCAPE':'LIFT'}
+              </Text>
+              {/* Floor indicator dots */}
+              <View style={{flexDirection:'row',gap:4,marginTop:4}}>
+                {[0,1,2,3].map(i=>(
+                  <View key={i} style={{width:5,height:5,borderRadius:3,backgroundColor:keysTaken[i]?theme.accent:theme.edge+'66'}}/>
+                ))}
+              </View>
+            </View>
+
+            {/* ── KEY ──────────────────────────────────────────────────────── */}
+            {keyAvailable&&(
+              <View style={{
+                position:'absolute',
+                left:(cf.key.x-16)*ZOOM,top:(cf.key.y-16)*ZOOM,
+                width:32*ZOOM,height:32*ZOOM,borderRadius:8,
+                backgroundColor:nearKey?theme.accent:theme.accent+'88',
+                justifyContent:'center',alignItems:'center',
+                borderWidth:1.5,borderColor:theme.accent,
+              }}>
+                <Text style={{fontSize:14*ZOOM}}>🗝</Text>
+                {nearKey&&<View style={{position:'absolute',bottom:-14*ZOOM,alignSelf:'center',backgroundColor:theme.accent,paddingHorizontal:4,paddingVertical:1,borderRadius:3}}>
+                  <Text style={{color:'black',fontWeight:'900',fontSize:7*ZOOM,fontFamily:'monospace'}}>HOLD</Text>
+                </View>}
+              </View>
+            )}
+
+            {/* ── BANDAGE ──────────────────────────────────────────────────── */}
+            {bandAvailable&&(
+              <View style={{
+                position:'absolute',
+                left:(cf.bandage.x-14)*ZOOM,top:(cf.bandage.y-14)*ZOOM,
+                width:28*ZOOM,height:28*ZOOM,borderRadius:7,
+                backgroundColor:nearBand?'#ddeedd':'#99bbaa88',
+                borderWidth:1.5,borderColor:'#aaccbb',
+                justifyContent:'center',alignItems:'center',
+              }}>
+                <Text style={{color:'#224433',fontWeight:'900',fontSize:14*ZOOM}}>+</Text>
+              </View>
+            )}
+
+            {/* ── GHOSTS ───────────────────────────────────────────────────── */}
+            {visibleEnemies.map((e,i)=>(
+              <View key={`e${i}`} style={{
+                position:'absolute',
+                left:(e.x-ENEMY_R*1.4)*ZOOM,
+                top:(e.y-ENEMY_R*1.4)*ZOOM,
+              }}>
+                <GhostSprite state={e.state} kind={e.kind} zoom={ZOOM}/>
+              </View>
+            ))}
+
+            {/* ── PLAYER ───────────────────────────────────────────────────── */}
+            <View style={{
+              position:'absolute',
+              left:(pl.x-18)*ZOOM-4,
+              top:(pl.y-32)*ZOOM-4,
+            }}>
+              <ChibiCharacter charData={charData} size={ZOOM*0.9}/>
+            </View>
+
+            {/* ── DARKNESS / FOG-OF-WAR ────────────────────────────────────── */}
+            <View style={{position:'absolute',left:0,top:0,width:WORLD_W*ZOOM,height:WORLD_H*ZOOM}} pointerEvents="none">
+              <Svg width={WORLD_W*ZOOM} height={WORLD_H*ZOOM}>
+                <Defs>
+                  <Mask id="vmask">
+                    <Rect x="0" y="0" width="100%" height="100%" fill="white"/>
+                    <Circle cx={pl.x*ZOOM} cy={pl.y*ZOOM} r={VISION_RADIUS*ZOOM} fill="black"/>
+                  </Mask>
+                </Defs>
+                <Rect x="0" y="0" width="100%" height="100%" fill={theme.vignette} mask="url(#vmask)"/>
+              </Svg>
+            </View>
+
+            {/* ── CHASE TINT ───────────────────────────────────────────────── */}
+            {anyChasing&&(
+              <View pointerEvents="none" style={{position:'absolute',left:0,top:0,width:WORLD_W*ZOOM,height:WORLD_H*ZOOM,backgroundColor:'rgba(255,0,30,0.07)'}}/>
+            )}
+            {panic.active&&(
+              <View pointerEvents="none" style={{position:'absolute',left:0,top:0,width:WORLD_W*ZOOM,height:WORLD_H*ZOOM,backgroundColor:'rgba(255,0,60,0.06)'}}/>
+            )}
+          </View>
+        </View>
+      </View>
+
+      {/* HINT */}
+      <View style={[SS.hintBox,{height:HINT_H,backgroundColor:anyChasing?'rgba(80,0,10,0.5)':anyAlert?'rgba(60,40,0,0.45)':'rgba(0,0,0,0.32)'}]}>
+        <Text style={[SS.hintText,{color:anyChasing?'#ffaaaa':anyAlert?'#ffddaa':'rgba(255,255,255,0.72)'}]} numberOfLines={2}>{hintText}</Text>
+      </View>
+
+      {/* CONTROLS */}
+      <View style={[SS.controls,{height:CONTROLS_H,paddingBottom:SAFE_BOT,backgroundColor:theme.bg2}]}>
+        <View style={SS.dirPad}>
+          <TouchableOpacity disabled={elevatorBusy} style={[SS.btn,{opacity:elevatorBusy?0.4:1,borderColor:theme.edge+'88'}]}
+            onPressIn={()=>moveRef.current.up=true} onPressOut={()=>moveRef.current.up=false}>
+            <Text style={SS.btnTxt}>↑</Text>
+          </TouchableOpacity>
+          <View style={{flexDirection:'row',gap:10}}>
+            <TouchableOpacity disabled={elevatorBusy} style={[SS.btn,{opacity:elevatorBusy?0.4:1,borderColor:theme.edge+'88'}]}
+              onPressIn={()=>moveRef.current.left=true} onPressOut={()=>moveRef.current.left=false}>
+              <Text style={SS.btnTxt}>←</Text>
+            </TouchableOpacity>
+            <TouchableOpacity disabled={elevatorBusy} style={[SS.btn,{opacity:elevatorBusy?0.4:1,borderColor:theme.edge+'88'}]}
+              onPressIn={()=>moveRef.current.right=true} onPressOut={()=>moveRef.current.right=false}>
+              <Text style={SS.btnTxt}>→</Text>
+            </TouchableOpacity>
+          </View>
+          <TouchableOpacity disabled={elevatorBusy} style={[SS.btn,{opacity:elevatorBusy?0.4:1,borderColor:theme.edge+'88'}]}
+            onPressIn={()=>moveRef.current.down=true} onPressOut={()=>moveRef.current.down=false}>
+            <Text style={SS.btnTxt}>↓</Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={{gap:10,alignItems:'flex-end'}}>
+          <TouchableOpacity disabled={!canCapture} style={[SS.btnBig,{borderColor:canCapture?theme.accent:theme.edge+'66',opacity:canCapture?1:0.42}]}
+            onPressIn={onCaptureDown} onPressOut={onCaptureUp}>
+            <Text style={[SS.btnTxt,{color:canCapture?theme.accent:'rgba(255,255,255,0.5)'}]}>{captureLabel}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            disabled={!inElevator||panic.active||elevatorBusy}
+            style={[SS.btnBig,{borderColor:inElevator&&!panic.active&&!elevatorBusy?theme.accent:theme.edge+'66',opacity:inElevator&&!panic.active&&!elevatorBusy?1:0.42}]}
+            onPress={elevatorSequence}>
+            <Text style={[SS.btnTxt,{color:inElevator&&!panic.active&&!elevatorBusy?theme.accent:'rgba(255,255,255,0.5)'}]}>{allKeys?'ESCAPE':'ELEVATOR'}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity disabled={elevatorBusy} style={[SS.btnBig,{opacity:elevatorBusy?0.4:0.75,borderColor:theme.edge+'55'}]} onPress={()=>setScreen('title')}>
+            <Text style={SS.btnTxt}>QUIT</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+
+      <CaptureOverlay visible={captureUI.visible} title={captureUI.type==='KEY'?'CAPTURING KEY':'CAPTURING BANDAGE'} progress01={captureUI.progress01} accent={theme.accent}/>
+      <ElevatorDoorsOverlay visible={doorsVisible} progress={doorsProgress} label={doorsLabel}/>
+    </SafeAreaView>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  STYLES
+// ─────────────────────────────────────────────────────────────────────────────
+const SS=StyleSheet.create({
+  full:         {flex:1},
+  hud:          {paddingHorizontal:14,paddingTop:8,paddingBottom:8,flexDirection:'row',alignItems:'center',justifyContent:'space-between'},
+  hudTitle:     {color:'white',fontSize:15,fontWeight:'900',fontFamily:'monospace',letterSpacing:3},
+  hudSub:       {color:'rgba(255,255,255,0.45)',fontSize:11,fontFamily:'monospace',letterSpacing:2},
+  hudTiny:      {color:'rgba(255,255,255,0.45)',fontSize:10,fontFamily:'monospace'},
+  panicText:    {color:'rgba(255,160,180,0.95)',fontSize:11,fontWeight:'900',fontFamily:'monospace'},
+  viewport:     {width:'100%',overflow:'hidden',borderTopWidth:1,borderBottomWidth:1},
+  hintBox:      {paddingHorizontal:14,paddingVertical:8,justifyContent:'center'},
+  hintText:     {fontSize:11,fontFamily:'monospace'},
+  controls:     {paddingHorizontal:14,paddingTop:10,flexDirection:'row',justifyContent:'space-between',alignItems:'flex-start'},
+  dirPad:       {gap:10,alignItems:'center'},
+  btn:          {width:56,height:44,borderRadius:12,backgroundColor:'rgba(255,255,255,0.04)',borderWidth:1,alignItems:'center',justifyContent:'center'},
+  btnBig:       {width:148,height:48,borderRadius:14,backgroundColor:'rgba(255,255,255,0.04)',borderWidth:2,alignItems:'center',justifyContent:'center'},
+  btnTxt:       {color:'white',fontWeight:'900',fontSize:13,fontFamily:'monospace',letterSpacing:1},
+  captureWrap:  {position:'absolute',left:0,right:0,top:0,bottom:0,justifyContent:'center',alignItems:'center'},
+  captureCard:  {width:220,paddingVertical:16,paddingHorizontal:14,borderRadius:18,backgroundColor:'rgba(0,0,0,0.78)',borderWidth:1,borderColor:'rgba(255,255,255,0.12)',alignItems:'center'},
+  captureTitle: {color:'white',fontWeight:'900',fontSize:13,fontFamily:'monospace',letterSpacing:1},
+  capturePct:   {color:'white',fontWeight:'900',fontSize:16},
+  captureSub:   {color:'rgba(255,255,255,0.6)',marginTop:2,fontSize:11},
+  doorsWrap:    {position:'absolute',left:0,right:0,top:0,bottom:0,justifyContent:'center',alignItems:'center'},
+  doorPanel:    {position:'absolute',top:0,bottom:0,width:'55%',backgroundColor:'#050508',borderColor:'rgba(255,255,255,0.10)',borderWidth:1},
+  doorLeft:     {left:0},
+  doorRight:    {right:0},
+  doorShade:    {position:'absolute',left:0,right:0,top:0,bottom:0,backgroundColor:'black'},
+  doorLabelWrap:{position:'absolute',top:80,alignSelf:'center',paddingHorizontal:14,paddingVertical:10,borderRadius:14,backgroundColor:'rgba(0,0,0,0.6)',borderWidth:1,borderColor:'rgba(255,255,255,0.12)'},
+  doorLabel:    {color:'white',fontWeight:'900',fontFamily:'monospace',letterSpacing:2},
+});

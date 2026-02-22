@@ -8,10 +8,10 @@
 **Group Name:** The Last Floor Team  
 ## 👩‍💻 Team Members
 - **Renad Alkahtani** – Team Leader  
-- **Waad Alshammari** – Game Logic Developer  
-- **Miad Alosaimi** – UI & Interaction Designer  
-- **Zahraa Altalalwah** – Audio & Atmosphere Designer  
-- **Amjad Alhabdan** – Testing & Documentation  
+- **Waad Alshammari** –  
+- **Miad Alosaimi** –   
+- **Zahraa Altalalwah** –  
+- **Amjad Alhabdan** –  
 
 > All team members contribute to coding in addition to their assigned roles.
 

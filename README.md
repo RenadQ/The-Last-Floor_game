@@ -9,9 +9,8 @@
 ## 👩‍💻 Team Members
 - **Renad Alkahtani** – Team Leader  
 - **Waad Alshammari** –  
-- **Miad Alosaimi** –   
 - **Zahraa Altalalwah** –  
-- **Amjad Alhabdan** –  
+
 
 > All team members contribute to coding in addition to their assigned roles.
 
